@@ -1,9 +1,11 @@
 package delta_test
 
 import (
+	"context"
 	"github.com/modfin/delta"
 	"github.com/stretchr/testify/assert"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -148,5 +150,29 @@ func TestSimpleQueue(t *testing.T) {
 	count := atomic.LoadInt64(&counter)
 
 	assert.Equal(t, int64(size), count)
+
+}
+
+func TestSimpleRequestReply(t *testing.T) {
+	slog.SetLogLoggerLevel(slog.LevelDebug)
+	defer slog.SetLogLoggerLevel(slog.LevelInfo)
+
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose(), delta.WithLogger(slog.Default()))
+	assert.NoError(t, err)
+
+	sub, err := mq.Queue("greet.*", "test")
+	assert.NoError(t, err)
+	go func() {
+		m := <-sub.Chan()
+		_, name, _ := strings.Cut(m.Topic, ".")
+		_, err = m.Reply([]byte("hello " + name))
+		assert.NoError(t, err)
+	}()
+
+	resp, err := mq.Request(context.Background(), "greet.alice", nil)
+	assert.NoError(t, err)
+	msg, ok := resp.Next()
+	assert.True(t, ok)
+	assert.Equal(t, "hello alice", string(msg.Payload))
 
 }

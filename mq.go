@@ -1,6 +1,7 @@
 package delta
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -353,6 +354,9 @@ func checkTopicPub(topic string) (string, error) {
 		if 'a' <= r && r <= 'z' {
 			continue
 		}
+		if '0' <= r && r <= '9' {
+			continue
+		}
 		switch r {
 		case '-', '_', '.':
 			continue
@@ -370,6 +374,9 @@ func checkTopicSub(topic string) (string, error) {
 	}
 	for _, r := range topic {
 		if 'a' <= r && r <= 'z' {
+			continue
+		}
+		if '0' <= r && r <= '9' {
 			continue
 		}
 		switch r {
@@ -459,8 +466,9 @@ func (s *Sub) Chan() <-chan Msg {
 	return s.notifyChan
 }
 
-func (s *Sub) Next() Msg {
-	return <-s.Chan()
+func (s *Sub) Next() (Msg, bool) {
+	m, ok := <-s.notifyChan
+	return m, ok
 }
 
 func (mq *MQ) Sub(topic string) (*Sub, error) {
@@ -483,6 +491,7 @@ func (mq *MQ) Sub(topic string) (*Sub, error) {
 	mq.subs.Insert(s)
 	s.Unsub = func() {
 		mq.subs.Remove(s)
+		close(s.notifyChan)
 	}
 
 	return s, nil
@@ -565,6 +574,7 @@ func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
 	sub.Unsub = func() { // TODO can this produce a deadlock? between the main and the sub?
 		g.mu.Lock()
 		defer g.mu.Unlock()
+		close(sub.notifyChan)
 		for i, s := range g.subs {
 			if s.id == sub.id {
 				g.subs = append(g.subs[:i], g.subs[i+1:]...)
@@ -582,4 +592,44 @@ func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
 
 	g.subs = append(g.subs, sub)
 	return sub, nil
+}
+
+func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Sub, error) {
+
+	m, err := mq.Pub(topic, payload)
+	if err != nil {
+		return nil, fmt.Errorf("could not pub, %w", err)
+	}
+
+	sub, err := mq.Sub(fmt.Sprintf("_inbox.%d", m.MessageId))
+	if err != nil {
+		return nil, fmt.Errorf("could not sub, %w", err)
+	}
+
+	s := &Sub{
+		id:         sub.id,
+		topic:      sub.topic,
+		Mode:       ReqRep,
+		notifyChan: make(chan Msg),
+	}
+
+	s.Unsub = func() {
+		close(s.notifyChan)
+	}
+
+	go func() {
+		defer sub.Unsub()
+		defer s.Unsub()
+
+		select {
+		case <-ctx.Done():
+		case m, ok := <-sub.Chan():
+			if ok {
+				s.notify(m)
+			}
+		}
+	}()
+
+	return s, nil
+
 }
