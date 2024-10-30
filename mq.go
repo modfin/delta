@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 	"log/slog"
 	"math/rand"
@@ -82,17 +83,35 @@ type MQ struct {
 	written uint64
 	read    uint64
 
+	streamMu sync.Mutex
+	stream   string // aka namespace, shard or whatever
+	streams  map[string]*MQ
+
 	writeMu sync.Mutex
 	inform  chan uint64
 
-	subs *globber[*Sub]
+	subs *globber[*Subscription]
 
 	groupMu sync.Mutex
 	groups  map[string]*group
 }
 
+func init() {
+	// adding special driver for sqlite3
+	// with support for specific glob match function for topic matching
+	// seems like it slows things down somewhat, from ~4 µs/msg to ~6 µs/msg
+	// probably hard for sqlite to optimize with indexes and so on
+	sql.Register("sqlite3_delta-v",
+		&sqlite3.SQLiteDriver{
+			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+				return conn.RegisterFunc("match_glob", globMatcher, true)
+			},
+		})
+}
+
 func New(uri string, op ...Op) (*MQ, error) {
-	db, err := sql.Open("sqlite3", uri)
+
+	db, err := sql.Open("sqlite3_delta-v", uri)
 	if err != nil {
 		return nil, fmt.Errorf("could not open db, %w", err)
 	}
@@ -111,15 +130,20 @@ func New(uri string, op ...Op) (*MQ, error) {
 		closed:        make(chan struct{}),
 		removeOnClose: new(bool),
 
+		streamMu: sync.Mutex{},
+		stream:   DEFAULT_STREAM,
+		streams:  make(map[string]*MQ),
+
 		written: 0,
 		read:    0,
 		inform:  make(chan uint64),
 
-		subs: newGlobber[*Sub](),
+		subs: newGlobber[*Subscription](),
 
 		groups: map[string]*group{},
 	}
 	*c.removeOnClose = false
+	c.streams[c.stream] = c
 
 	ops := append([]Op{dbDefault()}, op...)
 
@@ -157,7 +181,55 @@ func New(uri string, op ...Op) (*MQ, error) {
 }
 
 func (c *MQ) tbl() string {
-	return "_mq_delta"
+	return fmt.Sprintf("_mq_delta_stream_%s", c.stream)
+}
+
+func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+
+	stream, err := checkStreamName(stream)
+	if err != nil {
+		return nil, fmt.Errorf("could not check stream name, %w", err)
+	}
+
+	if _, found := c.streams[stream]; found {
+		return c.streams[stream], nil
+	}
+
+	cc := &MQ{
+		uri: c.uri,
+		db:  c.db,
+		log: slog.New(discardLogger{}),
+
+		closeOnce:     c.closeOnce,
+		closed:        c.closed,
+		removeOnClose: c.removeOnClose,
+
+		stream: stream,
+
+		written: 0,
+		read:    0,
+		inform:  make(chan uint64),
+
+		subs: newGlobber[*Subscription](),
+
+		groups: map[string]*group{},
+	}
+
+	err = schema(cc)
+	if err != nil {
+		return nil, fmt.Errorf("could not create schema for namespace, %w", err)
+	}
+
+	for _, op := range ops {
+		err := op(cc)
+		if err != nil {
+			return nil, fmt.Errorf("could not exec op, %w", err)
+		}
+	}
+
+	return cc, nil
 }
 
 func optimize(c *MQ) error {
@@ -165,7 +237,11 @@ func optimize(c *MQ) error {
 }
 
 func schema(c *MQ) error {
-	return exec(c.db, fmt.Sprintf(base_schema, c.tbl()))
+	return errors.Join(
+		exec(c.db, fmt.Sprintf(base_schema, c.tbl())),
+		exec(c.db, fmt.Sprintf(base_schema_idx, c.tbl(), c.tbl())),
+		exec(c.db, base_metadata_schema),
+	)
 }
 
 // Close closes the cache and all its namespaces
@@ -235,6 +311,10 @@ func (m *Msg) Reply(payload []byte) (Msg, error) {
 		Payload: payload,
 	}
 	return m.mq.write(reply)
+}
+
+func (m *Msg) Ack() error {
+	return nil
 }
 
 func (mq *MQ) write(m Msg) (Msg, error) {
@@ -334,62 +414,18 @@ func (mq *MQ) readloop() {
 
 }
 
-type Pub struct {
+type Publication struct {
 	Msg
 	Err  error
 	done chan struct{}
 }
 
-func (p *Pub) Done() <-chan struct{} {
+func (p *Publication) Done() <-chan struct{} {
 	return p.done
 }
 
-func checkTopicPub(topic string) (string, error) {
-	topic = strings.TrimSpace(topic)
-	topic = strings.ToLower(topic)
-	if len(topic) == 0 {
-		return "", fmt.Errorf("topic is empty")
-	}
-	for _, r := range topic {
-		if 'a' <= r && r <= 'z' {
-			continue
-		}
-		if '0' <= r && r <= '9' {
-			continue
-		}
-		switch r {
-		case '-', '_', '.':
-			continue
-		}
-		return "", fmt.Errorf("topic contains invalid character, only a-z, -, _, . are allowed, got %c", r)
-	}
-	return topic, nil
-}
-
-func checkTopicSub(topic string) (string, error) {
-	topic = strings.TrimSpace(topic)
-	topic = strings.ToLower(topic)
-	if len(topic) == 0 {
-		return "", fmt.Errorf("topic is empty")
-	}
-	for _, r := range topic {
-		if 'a' <= r && r <= 'z' {
-			continue
-		}
-		if '0' <= r && r <= '9' {
-			continue
-		}
-		switch r {
-		case '-', '_', '.', '*':
-			continue
-		}
-		return "", fmt.Errorf("topic contains invalid character, only a-z, -, _, ., * are allowed, got %c", r)
-	}
-	return topic, nil
-}
-
-func (mq *MQ) Pub(topic string, payload []byte) (*Pub, error) {
-	pub := &Pub{
+func (mq *MQ) Publish(topic string, payload []byte) (*Publication, error) {
+	pub := &Publication{
 		done: make(chan struct{}),
 	}
 	close(pub.done)
@@ -410,13 +446,13 @@ func (mq *MQ) Pub(topic string, payload []byte) (*Pub, error) {
 	return pub, err
 }
 
-func (mq *MQ) PubAsync(topic string, payload []byte) *Pub {
+func (mq *MQ) PublishAsync(topic string, payload []byte) *Publication {
 	payloadCopy := append([]byte{}, payload...)
-	pub := &Pub{
+	pub := &Publication{
 		done: make(chan struct{}),
 	}
 	go func() {
-		p, err := mq.Pub(topic, payloadCopy)
+		p, err := mq.Publish(topic, payloadCopy)
 		pub.Msg = p.Msg
 		pub.Err = err
 		close(pub.done)
@@ -424,36 +460,27 @@ func (mq *MQ) PubAsync(topic string, payload []byte) *Pub {
 	return pub
 }
 
-type Mode int
-
-const (
-	PubSub = iota
-	Queue
-	ReqRep
-)
-
-type Sub struct {
+type Subscription struct {
 	id    string
 	topic string
-	Mode  Mode
 	Unsub func()
 
 	notifyChan chan Msg
 	mu         sync.Mutex
 }
 
-func (s *Sub) Topic() string {
+func (s *Subscription) Topic() string {
 	return s.topic
 }
-func (s *Sub) Id() string {
+func (s *Subscription) Id() string {
 	return s.id
 }
 
-func (s *Sub) notify(m Msg) {
+func (s *Subscription) notify(m Msg) {
 	s.notifyChan <- m
 }
 
-func (s *Sub) tryNotify(m Msg) bool {
+func (s *Subscription) tryNotify(m Msg) bool {
 	select {
 	case s.notifyChan <- m:
 		return true
@@ -462,16 +489,16 @@ func (s *Sub) tryNotify(m Msg) bool {
 	}
 }
 
-func (s *Sub) Chan() <-chan Msg {
+func (s *Subscription) Chan() <-chan Msg {
 	return s.notifyChan
 }
 
-func (s *Sub) Next() (Msg, bool) {
+func (s *Subscription) Next() (Msg, bool) {
 	m, ok := <-s.notifyChan
 	return m, ok
 }
 
-func (mq *MQ) Sub(topic string) (*Sub, error) {
+func (mq *MQ) Subscribe(topic string) (*Subscription, error) {
 	uid, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("could not generate uuid, %w", err)
@@ -482,10 +509,9 @@ func (mq *MQ) Sub(topic string) (*Sub, error) {
 		return nil, fmt.Errorf("not a valid topic, %w", err)
 	}
 
-	s := &Sub{
+	s := &Subscription{
 		id:         uid.String(),
 		topic:      topic,
-		Mode:       PubSub,
 		notifyChan: make(chan Msg),
 	}
 	mq.subs.Insert(s)
@@ -499,11 +525,11 @@ func (mq *MQ) Sub(topic string) (*Sub, error) {
 
 type group struct {
 	mu   sync.Mutex
-	main *Sub
-	subs []*Sub
+	main *Subscription
+	subs []*Subscription
 }
 
-func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
+func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 
 	topic, err := checkTopicSub(topic)
 	if err != nil {
@@ -527,7 +553,7 @@ func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
 	defer g.mu.Unlock()
 
 	if g.main == nil {
-		g.main, err = mq.Sub(topic)
+		g.main, err = mq.Subscribe(topic)
 		if err != nil {
 			return nil, fmt.Errorf("could not create main subscriber, %w", err)
 		}
@@ -536,7 +562,7 @@ func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
 		outer:
 			for m := range g.main.Chan() {
 				g.mu.Lock()
-				ss := append([]*Sub{}, g.subs...)
+				ss := append([]*Subscription{}, g.subs...)
 				g.mu.Unlock()
 
 				rand.Shuffle(len(ss), func(i, j int) {
@@ -552,7 +578,7 @@ func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
 						continue outer
 					}
 				}
-				go func(s *Sub, m Msg) {
+				go func(s *Subscription, m Msg) {
 					s.notify(m)
 				}(ss[0], m)
 
@@ -564,10 +590,9 @@ func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not generate uuid, %w", err)
 	}
-	sub := &Sub{
+	sub := &Subscription{
 		id:         uid.String(),
 		topic:      topic,
-		Mode:       Queue,
 		notifyChan: make(chan Msg),
 	}
 
@@ -594,22 +619,21 @@ func (mq *MQ) Queue(topic string, key string) (*Sub, error) {
 	return sub, nil
 }
 
-func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Sub, error) {
+func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subscription, error) {
 
-	m, err := mq.Pub(topic, payload)
+	m, err := mq.Publish(topic, payload)
 	if err != nil {
 		return nil, fmt.Errorf("could not pub, %w", err)
 	}
 
-	sub, err := mq.Sub(fmt.Sprintf("_inbox.%d", m.MessageId))
+	sub, err := mq.Subscribe(fmt.Sprintf("_inbox.%d", m.MessageId))
 	if err != nil {
 		return nil, fmt.Errorf("could not sub, %w", err)
 	}
 
-	s := &Sub{
+	s := &Subscription{
 		id:         sub.id,
 		topic:      sub.topic,
-		Mode:       ReqRep,
 		notifyChan: make(chan Msg),
 	}
 
@@ -632,4 +656,45 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Sub, 
 
 	return s, nil
 
+}
+
+func (mq *MQ) SubFrom(topic string, from time.Time) (*Subscription, error) {
+	uid, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("could not generate uuid, %w", err)
+	}
+
+	topic, err = checkTopicSub(topic)
+	if err != nil {
+		return nil, fmt.Errorf("not a valid topic, %w", err)
+	}
+
+	s := &Subscription{
+		id:         uid.String(),
+		topic:      topic,
+		notifyChan: make(chan Msg),
+	}
+
+	s.Unsub = func() {
+		mq.subs.Remove(s)
+		close(s.notifyChan)
+	}
+
+	go func() {
+
+		var last time.Time
+		itr := iterMessage(mq.db, s.topic, from, mq.tbl, mq.log)
+		for m := range itr {
+			s.notify(m)
+			m.At = last
+		}
+		mq.subs.Insert(s) // TODO probalby insert a buffer here
+
+	}()
+
+	return s, nil
+}
+
+func (c *MQ) CurrentStream() string {
+	return c.stream
 }

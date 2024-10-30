@@ -6,6 +6,25 @@ import (
 	"sync"
 )
 
+func globMatcher(topic, glob string) (bool, error) {
+	globParts := strings.Split(glob, ".")
+	topicParts := strings.Split(topic, ".")
+
+	l := min(len(globParts), len(topicParts))
+	for i := 0; i < l; i++ {
+		if globParts[i] == "*" {
+			continue
+		}
+		if globParts[i] == "**" {
+			return true, nil
+		}
+		if globParts[i] != topicParts[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 type globbable interface {
 	Id() string // uniquely identify the subscriber
 	Topic() string

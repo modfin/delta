@@ -23,7 +23,7 @@ func BenchmarkPub(b *testing.B) {
 			start := time.Now()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					_, err = mq.Pub(topic, payload)
+					_, err = mq.Publish(topic, payload)
 					assert.NoError(b, err)
 				}
 			})
