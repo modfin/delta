@@ -1,10 +1,14 @@
 package delta
 
 import (
+	"encoding/base32"
+	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,7 +44,7 @@ func checkStreamName(stream string) (string, error) {
 		case '_':
 			continue
 		}
-		return "", fmt.Errorf("stream contains invalid character, only a-z, 0-9 and _ are allowed, name contains '%c'", r)
+		return "", fmt.Errorf("stream_ contains invalid character, only a-z, 0-9 and _ are allowed, name contains '%c'", r)
 	}
 	return stream, nil
 }
@@ -87,4 +91,27 @@ func checkTopicSub(topic string) (string, error) {
 		return "", fmt.Errorf("topic contains invalid character, only a-z, -, _, ., * are allowed, got %c", r)
 	}
 	return topic, nil
+}
+
+var uid_count uint32
+
+func uid() string {
+
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
+	t := time.Now().UnixNano()
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(t))
+	ts := enc.EncodeToString(b)
+
+	countInt := atomic.AddUint32(&uid_count, 1)
+	b = make([]byte, 4)
+	binary.BigEndian.PutUint32(b, countInt)
+	count := enc.EncodeToString(b)
+
+	randInt := rand.Uint64()
+	b = make([]byte, 4)
+	binary.BigEndian.PutUint32(b, uint32(randInt))
+	rand := enc.EncodeToString(b)
+
+	return strings.ToLower(fmt.Sprintf("%s-%s-%s", ts, count, rand))
 }

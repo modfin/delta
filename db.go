@@ -26,7 +26,7 @@ const base_schema = `CREATE TABLE IF NOT EXISTS %s (
 const base_schema_idx = `CREATE INDEX IF NOT EXISTS %s__topic_idx ON %s (topic);`
 
 const base_metadata_schema = `CREATE TABLE IF NOT EXISTS _mq_delta_metadata (
-    			key TEXT,
+    			key TEXT PRIMARY KEY,
     			value TEXT,
     			created_at BIGINT
 		 );`
@@ -41,18 +41,49 @@ func exec(db query, qs ...string) error {
 	return nil
 }
 
-func serial(db query, tbl func() string) (uint64, error) {
-	q := fmt.Sprintf(`SELECT coalesce(MAX(message_id), 0) FROM %s`, tbl())
-	r := db.QueryRow(q)
-	var s uint64
-	err := r.Scan(&s)
+func ackRead(db query, read uint64, tbl func() string) error {
+	q := fmt.Sprintf(`
+		INSERT INTO _mq_delta_metadata (key, value, created_at) 
+		VALUES ($1, CAST($2 AS TEXT), $3) 
+		ON CONFLICT (key)
+		    DO UPDATE 
+		    SET 
+		        value = excluded.value, 
+		        created_at = excluded.created_at`)
+	_, err := db.Exec(q, tbl()+"_read", read, time.Now().UnixNano())
+	return err
+}
+func ackWritten(db query, written uint64, tbl func() string) error {
+	q := fmt.Sprintf(`
+		INSERT INTO _mq_delta_metadata (key, value, created_at) 
+		VALUES ($1, CAST($2 AS TEXT), $3) 
+		ON CONFLICT (key)
+		    DO UPDATE 
+		    SET 
+		        value = excluded.value, 
+		        created_at = excluded.created_at`)
+	_, err := db.Exec(q, tbl()+"_written", written, time.Now().UnixNano())
+	return err
+}
+
+func metrics(db query, tbl func() string) (written uint64, read uint64, err error) {
+	q := fmt.Sprintf(`
+		SELECT
+   	       (SELECT coalesce(MAX(message_id), 0) FROM %s ) as "written",
+		   coalesce(
+		   		(SELECT CAST("value" as BIGINT )  FROM _mq_delta_metadata WHERE "key" = ($1 || '_read'))
+		   		, 1
+		   ) "read"	
+   	
+	`, tbl())
+	r := db.QueryRow(q, tbl())
+
+	err = r.Scan(&written, &read)
 
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
+		return 0, 0, nil
 	}
-
-	return s, err
-
+	return written, read, err
 }
 
 func persist(db query, m Msg, tbl func() string) error {
@@ -80,7 +111,7 @@ func message(db *sql.DB, id uint64, tbl func() string) (Msg, error) {
 
 }
 
-func iterMessage(db query, topic string, from time.Time, tbl func() string, log *slog.Logger) iter.Seq[Msg] {
+func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() string, log *slog.Logger) iter.Seq[Msg] {
 
 	glob := strings.Contains(topic, "*")
 
@@ -92,7 +123,8 @@ func iterMessage(db query, topic string, from time.Time, tbl func() string, log 
 				FROM %s 
 				WHERE topic = $1 
 				  AND created_at >= $2 
-				ORDER BY created_at`, tbl()), topic, from.UnixNano())
+				  AND message_id <= $3
+				ORDER BY created_at`, tbl()), topic, from.UnixNano(), to)
 	}
 
 	if glob {
@@ -104,7 +136,8 @@ func iterMessage(db query, topic string, from time.Time, tbl func() string, log 
 				WHERE topic like $1 
 				  AND match_glob(topic, $2) 
 				  AND created_at >= $3 
-				ORDER BY created_at`, tbl()), start, topic, from.UnixNano())
+				  AND message_id <= $4
+				ORDER BY created_at`, tbl()), start, topic, from.UnixNano(), to)
 	}
 
 	if err != nil {

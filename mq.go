@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 	"log/slog"
@@ -23,7 +22,7 @@ type Op func(*MQ) error
 
 func dbPragma(pragma string) Op {
 	return func(c *MQ) error {
-		return exec(c.db,
+		return exec(c.base.db,
 			fmt.Sprintf(`pragma %s;`, pragma),
 		)
 	}
@@ -43,7 +42,7 @@ func DBSyncOff() Op {
 // DBRemoveOnClose is a helper function to remove the database files on close
 func DBRemoveOnClose() Op {
 	return func(mq *MQ) error {
-		*mq.removeOnClose = true
+		mq.base.removeOnClose = true
 		return nil
 	}
 }
@@ -54,7 +53,7 @@ func WithLogger(log *slog.Logger) Op {
 		if log == nil {
 			log = slog.New(discardLogger{})
 		}
-		c.log = log
+		c.base.log = log
 		return nil
 	}
 }
@@ -70,30 +69,36 @@ func dbDefault() Op {
 	}
 }
 
-type MQ struct {
+type base_ struct {
 	//shards
 	uri string
 
 	db            *sql.DB
-	closeOnce     *sync.Once
+	closeOnce     sync.Once
 	closed        chan struct{}
-	removeOnClose *bool
+	removeOnClose bool
 	log           *slog.Logger
+	streamMu      sync.Mutex
+	streams       map[string]*MQ
+}
+
+type stream_ struct {
+	name string // aka namespace, shard or whatever
 
 	written uint64
 	read    uint64
 
-	streamMu sync.Mutex
-	stream   string // aka namespace, shard or whatever
-	streams  map[string]*MQ
-
 	writeMu sync.Mutex
-	inform  chan uint64
 
 	subs *globber[*Subscription]
 
 	groupMu sync.Mutex
 	groups  map[string]*group
+}
+
+type MQ struct {
+	base   *base_
+	stream stream_
 }
 
 func init() {
@@ -122,32 +127,32 @@ func New(uri string, op ...Op) (*MQ, error) {
 	}
 
 	c := &MQ{
-		uri: uri,
-		db:  db,
-		log: slog.New(discardLogger{}),
+		base: &base_{
+			uri: uri,
+			db:  db,
+			log: slog.New(discardLogger{}),
 
-		closeOnce:     &sync.Once{},
-		closed:        make(chan struct{}),
-		removeOnClose: new(bool),
+			closeOnce:     sync.Once{},
+			closed:        make(chan struct{}),
+			removeOnClose: false,
+			streamMu:      sync.Mutex{},
+			streams:       make(map[string]*MQ),
+		},
+		stream: stream_{
+			name:    DEFAULT_STREAM,
+			written: 0,
+			read:    0,
 
-		streamMu: sync.Mutex{},
-		stream:   DEFAULT_STREAM,
-		streams:  make(map[string]*MQ),
+			subs: newGlobber[*Subscription](),
 
-		written: 0,
-		read:    0,
-		inform:  make(chan uint64),
-
-		subs: newGlobber[*Subscription](),
-
-		groups: map[string]*group{},
+			groups: map[string]*group{},
+		},
 	}
-	*c.removeOnClose = false
-	c.streams[c.stream] = c
+	c.base.streams[c.stream.name] = c
 
 	ops := append([]Op{dbDefault()}, op...)
 
-	c.log.Debug("[delta] applying options")
+	c.base.log.Debug("[delta] applying options")
 	for _, op := range ops {
 		err := op(c)
 		if err != nil {
@@ -155,25 +160,27 @@ func New(uri string, op ...Op) (*MQ, error) {
 		}
 	}
 
-	c.log.Debug("[delta] creating schema")
+	c.base.log.Debug("[delta] creating schema")
 	err = schema(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed in creating schema, %w", err)
 	}
 
-	c.log.Debug("[delta] optimizing database")
+	c.base.log.Debug("[delta] optimizing database")
 	err = optimize(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed in optimizing, %w", err)
 	}
 
-	maxSerial, err := serial(c.db, c.tbl)
+	written, read, err := metrics(c.base.db, c.tbl)
 	if err != nil {
 		return nil, fmt.Errorf("could not get written, %w", err)
 	}
 
-	atomic.SwapUint64(&c.written, maxSerial)
-	atomic.SwapUint64(&c.read, maxSerial+1) // Probably load some sort of read counter instead?
+	c.base.log.Info("[delta] starting stream_ at", "written", written, "read", read, "stream_", c.stream)
+
+	atomic.SwapUint64(&c.stream.written, written)
+	atomic.SwapUint64(&c.stream.read, read) // Probably load some sort of read counter instead?
 
 	c.readloop()
 
@@ -181,41 +188,35 @@ func New(uri string, op ...Op) (*MQ, error) {
 }
 
 func (c *MQ) tbl() string {
-	return fmt.Sprintf("_mq_delta_stream_%s", c.stream)
+	return fmt.Sprintf("_mq_delta_stream_%s", c.CurrentStream())
 }
 
 func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
-	c.streamMu.Lock()
-	defer c.streamMu.Unlock()
+	c.base.streamMu.Lock()
+	defer c.base.streamMu.Unlock()
 
 	stream, err := checkStreamName(stream)
 	if err != nil {
-		return nil, fmt.Errorf("could not check stream name, %w", err)
+		return nil, fmt.Errorf("could not check stream_ name, %w", err)
 	}
 
-	if _, found := c.streams[stream]; found {
-		return c.streams[stream], nil
+	if _, found := c.base.streams[stream]; found {
+		return c.base.streams[stream], nil
 	}
 
 	cc := &MQ{
-		uri: c.uri,
-		db:  c.db,
-		log: slog.New(discardLogger{}),
-
-		closeOnce:     c.closeOnce,
-		closed:        c.closed,
-		removeOnClose: c.removeOnClose,
-
-		stream: stream,
-
-		written: 0,
-		read:    0,
-		inform:  make(chan uint64),
-
-		subs: newGlobber[*Subscription](),
-
-		groups: map[string]*group{},
+		base: c.base,
+		stream: stream_{
+			name:    stream,
+			written: 0,
+			read:    0,
+			writeMu: sync.Mutex{},
+			subs:    newGlobber[*Subscription](),
+			groupMu: sync.Mutex{},
+			groups:  map[string]*group{},
+		},
 	}
+	cc.base.streams[stream] = cc
 
 	err = schema(cc)
 	if err != nil {
@@ -229,47 +230,65 @@ func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
 		}
 	}
 
+	written, read, err := metrics(cc.base.db, cc.tbl)
+	if err != nil {
+		return nil, fmt.Errorf("could not get metrics, %w", err)
+	}
+	c.base.log.Info("[delta] starting stream_ at", "written", written, "read", read, "stream_", cc.stream)
+
+	atomic.SwapUint64(&cc.stream.written, written)
+	atomic.SwapUint64(&cc.stream.read, read)
+	cc.readloop()
+
 	return cc, nil
 }
 
 func optimize(c *MQ) error {
-	return exec(c.db, `pragma vacuum;`, `pragma optimize;`)
+	return exec(c.base.db, `pragma vacuum;`, `pragma optimize;`)
 }
 
 func schema(c *MQ) error {
 	return errors.Join(
-		exec(c.db, fmt.Sprintf(base_schema, c.tbl())),
-		exec(c.db, fmt.Sprintf(base_schema_idx, c.tbl(), c.tbl())),
-		exec(c.db, base_metadata_schema),
+		exec(c.base.db, fmt.Sprintf(base_schema, c.tbl())),
+		exec(c.base.db, fmt.Sprintf(base_schema_idx, c.tbl(), c.tbl())),
+		exec(c.base.db, base_metadata_schema),
 	)
 }
 
 // Close closes the cache and all its namespaces
 func (c *MQ) Close() error {
+
 	defer func() {
-		if *c.removeOnClose {
+		if c.base.removeOnClose {
 			_ = c.removeStore()
 		}
 	}()
 
-	defer func() {
-		c.closeOnce.Do(func() {
-			close(c.closed)
-		})
-	}()
+	c.base.closeOnce.Do(func() {
+		close(c.base.closed)
+	})
 
-	return c.db.Close()
-}
-
-func (c *MQ) removeStore() error {
-
-	select {
-	case <-c.closed:
-	default:
-		return fmt.Errorf("db is not closed")
+	for _, cc := range c.base.streams {
+		err := ackWritten(cc.base.db, atomic.LoadUint64(&cc.stream.written), cc.tbl)
+		if err != nil {
+			return fmt.Errorf("could not ack written, %w", err)
+		}
+		w, r, err := metrics(cc.base.db, cc.tbl)
+		if err != nil {
+			return fmt.Errorf("could not get metrics, %w", err)
+		}
+		c.base.log.Info("[delta] closing stream_", "stream_", cc.CurrentStream(), "written", w, "read", r)
 	}
 
-	schema, uri, found := strings.Cut(c.uri, ":")
+	return c.base.db.Close()
+}
+
+func RemoveStore(uri string, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.New(discardLogger{})
+	}
+
+	schema, uri, found := strings.Cut(uri, ":")
 	if !found {
 		return fmt.Errorf("could not find file in uri")
 	}
@@ -279,7 +298,7 @@ func (c *MQ) removeStore() error {
 
 	file, query, _ := strings.Cut(uri, "?")
 
-	c.log.Info("[delta] remove store", "db", file, "shm", fmt.Sprintf("%s-shm", file), "wal", fmt.Sprintf("%s-wal", file))
+	logger.Info("[delta] remove store", "db", file, "shm", fmt.Sprintf("%s-shm", file), "wal", fmt.Sprintf("%s-wal", file))
 
 	err := errors.Join(
 		os.Remove(file),
@@ -287,11 +306,20 @@ func (c *MQ) removeStore() error {
 		os.Remove(fmt.Sprintf("%s-wal", file)),
 	)
 	if strings.Contains(query, "tmp=true") {
-		c.log.Info("[delta] remove store dir", "dir", filepath.Dir(file))
+		logger.Info("[delta] remove store dir", "dir", filepath.Dir(file))
 		err = errors.Join(os.Remove(filepath.Dir(file)), err)
 	}
-
 	return err
+}
+func (c *MQ) removeStore() error {
+
+	select {
+	case <-c.base.closed:
+	default:
+		return fmt.Errorf("db is not closed")
+	}
+
+	return RemoveStore(c.base.uri, c.base.log)
 }
 
 type Msg struct {
@@ -322,46 +350,66 @@ func (mq *MQ) write(m Msg) (Msg, error) {
 	// in this section  seems to slow down the write operation from 33 000msg/s to 13 000 msg/s
 
 	// since write operations are not concurrent a lock here is probably fine
-	//   and helps us out lot when it comes to ordering
-	mq.writeMu.Lock()
-	defer mq.writeMu.Unlock()
+	//   and helps us out lot that things are written in order.
+	mq.stream.writeMu.Lock()
+	defer mq.stream.writeMu.Unlock()
 
-	m.MessageId = atomic.LoadUint64(&mq.written) + 1 // probably not needed due to lock
-	defer atomic.AddUint64(&mq.written, 1)
+	m.MessageId = atomic.LoadUint64(&mq.stream.written) + 1 // probably not needed due to lock
+	defer atomic.AddUint64(&mq.stream.written, 1)
 
 	m.At = time.Now()
-	err := persist(mq.db, m, mq.tbl)
+	err := persist(mq.base.db, m, mq.tbl)
 	if err != nil {
 		return m, fmt.Errorf("could not persist, %w", err)
 	}
-	select { // inform of new write
-	case mq.inform <- m.MessageId:
-	default:
+
+	//go func() { // probably faster to remove this and have a righter sleep
+	//	select { // inform of new write
+	//	case mq.inform <- struct{}{}:
+	//	default:
+	//	}
+	//}()
+
+	if m.MessageId%1000 == 1000-1 {
+		err = ackWritten(mq.base.db, m.MessageId, mq.tbl)
+		if err != nil {
+			return m, fmt.Errorf("could not ack written, %w", err)
+		}
 	}
+
 	return m, nil
 
 }
 
 func (mq *MQ) readloop() {
-	mq.log.Debug("[delta] starting loop stopping")
-	var size = uint64(runtime.NumCPU() * 2)
+	mq.base.log.Debug("[delta] starting loop", "stream_", mq.CurrentStream())
+	var size = max(uint64(runtime.NumCPU()), 4)
 
 	var jobs = make(chan uint64)
 
 	producer := func() {
+		var dirty bool
 		for {
 
+			if dirty {
+				dirty = false
+				err := ackRead(mq.base.db, atomic.LoadUint64(&mq.stream.read), mq.tbl)
+				if err != nil {
+					mq.base.log.Error("[delta] could not ack read", "err", err, "stream_", mq.CurrentStream())
+				}
+			}
+
 			select {
-			case <-mq.closed:
-				mq.log.Debug("[delta] reader, stopping loop")
+			case <-mq.base.closed:
+				mq.base.log.Debug("[delta] reader, stopping loop", "stream_", mq.CurrentStream())
 				return
-			case <-mq.inform:
-			case <-time.After(100 * time.Millisecond):
+			//case <-mq.inform: // probably faster to remove this and have a righter sleep
+			case <-time.After(50 * time.Millisecond):
 			}
 
 			for {
-				written := atomic.LoadUint64(&mq.written)
-				read := atomic.LoadUint64(&mq.read)
+				written := atomic.LoadUint64(&mq.stream.written)
+				read := atomic.LoadUint64(&mq.stream.read)
 
 				// if we have read all messages, need to wait for new messages
 				if read > written {
@@ -369,11 +417,11 @@ func (mq *MQ) readloop() {
 				}
 
 				written = min(written, read+size)
-
 				for ; read <= written; read++ {
 					jobs <- read
 				}
-				atomic.StoreUint64(&mq.read, read)
+				atomic.StoreUint64(&mq.stream.read, read)
+				dirty = true
 			}
 		}
 	}
@@ -383,18 +431,17 @@ func (mq *MQ) readloop() {
 
 			var messageId uint64
 			select {
-			case <-mq.closed:
-				mq.log.Debug("[delta] reading consumer stopping loop", "id", i)
+			case <-mq.base.closed:
 				return
 			case messageId = <-jobs:
 			}
-			m, err := message(mq.db, messageId, mq.tbl)
+			m, err := message(mq.base.db, messageId, mq.tbl)
 			if err != nil {
-				mq.log.Error("[delta] could not get message", "id", messageId, "err", err)
+				mq.base.log.Error("[delta] could not get message", "id", messageId, "err", err, "stream_", mq.CurrentStream())
 				continue
 			}
 
-			subs := mq.subs.Match(m.Topic)
+			subs := mq.stream.subs.Match(m.Topic)
 			for _, s := range subs {
 				s := s
 				m := m
@@ -465,8 +512,20 @@ type Subscription struct {
 	topic string
 	Unsub func()
 
+	closeOnce  sync.Once
+	closed     bool
 	notifyChan chan Msg
+	notifyMu   sync.RWMutex
 	mu         sync.Mutex
+}
+
+func (s *Subscription) close() {
+	s.notifyMu.Lock()
+	defer s.notifyMu.Unlock()
+	s.closeOnce.Do(func() {
+		s.closed = true
+		close(s.notifyChan)
+	})
 }
 
 func (s *Subscription) Topic() string {
@@ -477,10 +536,21 @@ func (s *Subscription) Id() string {
 }
 
 func (s *Subscription) notify(m Msg) {
+	s.notifyMu.RLock()
+	defer s.notifyMu.RUnlock()
+	if s.closed {
+		return
+	}
+	// TODO this could deadloack if no one is reading from the channel and we try to close it
 	s.notifyChan <- m
 }
 
-func (s *Subscription) tryNotify(m Msg) bool {
+func (s *Subscription) tryNotify(m Msg) (written bool) {
+	s.notifyMu.RLock()
+	defer s.notifyMu.RUnlock()
+	if s.closed {
+		return false
+	}
 	select {
 	case s.notifyChan <- m:
 		return true
@@ -499,24 +569,21 @@ func (s *Subscription) Next() (Msg, bool) {
 }
 
 func (mq *MQ) Subscribe(topic string) (*Subscription, error) {
-	uid, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("could not generate uuid, %w", err)
-	}
+	uid := uid()
 
-	topic, err = checkTopicSub(topic)
+	topic, err := checkTopicSub(topic)
 	if err != nil {
 		return nil, fmt.Errorf("not a valid topic, %w", err)
 	}
 
 	s := &Subscription{
-		id:         uid.String(),
+		id:         uid,
 		topic:      topic,
 		notifyChan: make(chan Msg),
 	}
-	mq.subs.Insert(s)
+	mq.stream.subs.Insert(s)
 	s.Unsub = func() {
-		mq.subs.Remove(s)
+		mq.stream.subs.Remove(s)
 		close(s.notifyChan)
 	}
 
@@ -541,13 +608,13 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 	}
 	key = fmt.Sprintf("%s[%s]", topic, key)
 
-	mq.groupMu.Lock()
-	g := mq.groups[key]
+	mq.stream.groupMu.Lock()
+	g := mq.stream.groups[key]
 	if g == nil {
-		mq.groups[key] = &group{}
-		g = mq.groups[key]
+		mq.stream.groups[key] = &group{}
+		g = mq.stream.groups[key]
 	}
-	mq.groupMu.Unlock()
+	mq.stream.groupMu.Unlock()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -586,12 +653,8 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 		}()
 	}
 
-	uid, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("could not generate uuid, %w", err)
-	}
 	sub := &Subscription{
-		id:         uid.String(),
+		id:         uid(),
 		topic:      topic,
 		notifyChan: make(chan Msg),
 	}
@@ -608,10 +671,10 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 		}
 
 		if len(g.subs) == 0 {
-			mq.groupMu.Lock()
+			mq.stream.groupMu.Lock()
 			g.main.Unsub()
-			delete(mq.groups, key)
-			mq.groupMu.Unlock()
+			delete(mq.stream.groups, key)
+			mq.stream.groupMu.Unlock()
 		}
 	}
 
@@ -659,42 +722,58 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 }
 
 func (mq *MQ) SubFrom(topic string, from time.Time) (*Subscription, error) {
-	uid, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("could not generate uuid, %w", err)
-	}
-
-	topic, err = checkTopicSub(topic)
+	topic, err := checkTopicSub(topic)
 	if err != nil {
 		return nil, fmt.Errorf("not a valid topic, %w", err)
 	}
 
 	s := &Subscription{
-		id:         uid.String(),
+		id:         uid(),
+		topic:      topic,
+		notifyChan: make(chan Msg),
+	}
+
+	buffer := &Subscription{
+		id:         uid(),
 		topic:      topic,
 		notifyChan: make(chan Msg),
 	}
 
 	s.Unsub = func() {
-		mq.subs.Remove(s)
-		close(s.notifyChan)
+		mq.stream.subs.Remove(buffer)
+		buffer.close()
 	}
 
 	go func() {
 
+		mq.stream.subs.Insert(buffer)
+		splitt := atomic.LoadUint64(&mq.stream.written)
+
+		start := sync.WaitGroup{}
+		start.Add(1)
+		go func() {
+			start.Wait()
+			for m := range buffer.Chan() {
+				if m.MessageId <= splitt {
+					continue
+				}
+				s.notify(m)
+			}
+			close(s.notifyChan)
+		}()
+
 		var last time.Time
-		itr := iterMessage(mq.db, s.topic, from, mq.tbl, mq.log)
+		itr := iterMessage(mq.base.db, s.topic, from, splitt, mq.tbl, mq.base.log)
 		for m := range itr {
 			s.notify(m)
 			m.At = last
 		}
-		mq.subs.Insert(s) // TODO probalby insert a buffer here
-
+		start.Done()
 	}()
 
 	return s, nil
 }
 
 func (c *MQ) CurrentStream() string {
-	return c.stream
+	return c.stream.name
 }

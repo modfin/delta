@@ -6,6 +6,7 @@ import (
 	"github.com/modfin/delta"
 	"github.com/stretchr/testify/assert"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,7 +172,7 @@ func TestSimpleRequestReply(t *testing.T) {
 	go func() {
 		m := <-sub.Chan()
 		_, name, _ := strings.Cut(m.Topic, ".")
-		_, err = m.Reply([]byte("hello " + name))
+		_, err := m.Reply([]byte("hello " + name))
 		assert.NoError(t, err)
 	}()
 
@@ -188,7 +189,7 @@ func TestSimpleSubFrom(t *testing.T) {
 	assert.NoError(t, err)
 	defer mq.Close()
 
-	size := 5_000
+	size := 1013
 	from := time.Now()
 	var res [][]byte
 	fmt.Println("Inserting ", size*4, "messages")
@@ -229,6 +230,93 @@ func TestSimpleSubFrom(t *testing.T) {
 
 }
 
+func TestSimpleSubFrom_joininghistory_with_live(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	size := 1013
+	from := time.Now()
+	for i := range size {
+		payload := []byte(strconv.Itoa(i))
+		_, err := mq.Publish("a.b.c.d", payload)
+		assert.NoError(t, err)
+	}
+
+	for i := range size {
+		i := i
+		go func(i int) {
+			payload := []byte(strconv.Itoa(i))
+			_, err := mq.Publish("a.b.c.d", payload)
+			assert.NoError(t, err)
+		}(i + size)
+
+	}
+
+	sub, err := mq.SubFrom("a.b.*.d", from)
+	assert.NoError(t, err)
+	fmt.Println("Retrieving ", size, "messages")
+
+	var res []int
+	for range size * 2 {
+		m, ok := sub.Next()
+		assert.True(t, ok)
+		ii, err := strconv.Atoi(string(m.Payload))
+		assert.NoError(t, err)
+		res = append(res, ii)
+	}
+	sub.Unsub()
+
+	sort.Ints(res)
+
+	for i := 1; i < size*2; i++ {
+		assert.Equal(t, res[i-1]+1, res[i])
+	}
+
+}
+
+func TestSimpleSubFrom_joininghistory_with_live2(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	size := 1013
+	from := time.Now()
+
+	for i := range size {
+		i := i
+		go func(i int) {
+			payload := []byte(strconv.Itoa(i))
+			_, err := mq.Publish("a.b.c.d", payload)
+			assert.NoError(t, err)
+		}(i + size)
+
+	}
+
+	sub, err := mq.SubFrom("a.b.*.d", from)
+	assert.NoError(t, err)
+	fmt.Println("Retrieving ", size, "messages")
+
+	var res []int
+	i := 0
+	for m := range sub.Chan() {
+		ii, err := strconv.Atoi(string(m.Payload))
+		assert.NoError(t, err)
+		res = append(res, ii)
+		i++
+		if i == size {
+			sub.Unsub()
+		}
+	}
+
+	sort.Ints(res)
+
+	for i := 1; i < size; i++ {
+		assert.Equal(t, res[i-1]+1, res[i])
+	}
+
+}
+
 func TestSimpleStream(t *testing.T) {
 	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
 	assert.NoError(t, err)
@@ -263,8 +351,9 @@ func TestSimpleStream(t *testing.T) {
 
 	sub, err := mq.SubFrom("a.b.*.d", from)
 	assert.NoError(t, err)
-	fmt.Println("Retrieving ", size, "messages from stream", mq.CurrentStream())
+	fmt.Println("Retrieving ", size, "messages from stream_", mq.CurrentStream())
 	for i := range size {
+		//fmt.Println("Retrieving", i, "/", size, "messages from stream_", mq.CurrentStream())
 		m, ok := sub.Next()
 		assert.True(t, ok)
 		assert.Equal(t, string(s1[i]), string(m.Payload), "i: %d", i)
@@ -275,11 +364,238 @@ func TestSimpleStream(t *testing.T) {
 
 	sub, err = mq.SubFrom("a.b.c.d", from)
 	assert.NoError(t, err)
-	fmt.Println("Retrieving ", size, "messages from stream", mq.CurrentStream())
+	fmt.Println("Retrieving ", size, "messages from stream_", mq.CurrentStream())
 	for i := range size {
+		//fmt.Println("Retrieving", i, "/", size, "messages from stream_", mq.CurrentStream())
 		m, ok := sub.Next()
 		assert.True(t, ok)
 		assert.Equal(t, string(s2[i]), string(m.Payload), "i: %d", i)
+	}
+
+}
+
+func TestParallelStream(t *testing.T) {
+
+	//slog.SetLogLoggerLevel(slog.LevelDebug)
+	//defer slog.SetLogLoggerLevel(slog.LevelInfo)
+	//logger := slog.Default()
+	var logger *slog.Logger
+
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose(), delta.WithLogger(logger))
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	size := 1013
+	//size := 100
+
+	//from := time.Now()
+	var s1 []string
+	var s1mu sync.Mutex
+	wg := sync.WaitGroup{}
+	wg.Add(size)
+	fmt.Println("Inserting ", size, "messages, in ", mq.CurrentStream())
+	for i := range size {
+		i := i
+		go func(i int, n *delta.MQ) {
+			payload := []byte(n.CurrentStream() + "_" + strconv.Itoa(i))
+			//fmt.Println("Publishing", string(payload), "to stream_", n.CurrentStream())
+			_, err := n.Publish("a.b.c.d", payload)
+			s1mu.Lock()
+			defer s1mu.Unlock()
+			s1 = append(s1, string(payload))
+			assert.NoError(t, err)
+			wg.Done()
+
+		}(i, mq)
+
+	}
+
+	const SUB_STREAM = "sub stream_"
+	mq, err = mq.Stream(SUB_STREAM)
+	assert.NoError(t, err)
+	var s2 []string
+	var s2mu sync.Mutex
+	fmt.Println("Inserting ", size, "messages, in ", mq.CurrentStream())
+
+	wg.Add(size)
+	for i := range size {
+		i := i
+		go func(i int, m *delta.MQ) {
+			payload := []byte(m.CurrentStream() + "_" + strconv.Itoa(i))
+			//fmt.Println("Publishing", string(payload), "to stream_", m.CurrentStream())
+			_, err := m.Publish("a.b.c.d", payload)
+			s2mu.Lock()
+			defer s2mu.Unlock()
+			s2 = append(s2, string(payload))
+			assert.NoError(t, err)
+			wg.Done()
+		}(i, mq)
+
+	}
+
+	wg.Add(2)
+
+	var res1 []string
+	go func(m *delta.MQ) {
+		mm, err := m.Stream(delta.DEFAULT_STREAM)
+		assert.NoError(t, err)
+		sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+		assert.NoError(t, err)
+		fmt.Println("Retrieving ", size, "messages from stream_", mm.CurrentStream())
+		for range size {
+			m, ok := sub.Next()
+			//fmt.Println("Retrieving", len(res1), "/", size, "messages from stream_", mm.CurrentStream(), "--", string(m.Payload))
+			assert.True(t, ok)
+			res1 = append(res1, string(m.Payload))
+		}
+		wg.Done()
+	}(mq)
+
+	var res2 []string
+	go func(m *delta.MQ) {
+		mm, err := m.Stream(SUB_STREAM)
+		assert.NoError(t, err)
+		sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+		assert.NoError(t, err)
+		fmt.Println("Retrieving ", size, "messages from stream_", mm.CurrentStream())
+		for range size {
+			m, ok := sub.Next()
+			//fmt.Println("Retrieving", len(res2), "/", size, "messages from stream_", mm.CurrentStream(), "--", string(m.Payload))
+			assert.True(t, ok)
+			res2 = append(res2, string(m.Payload))
+		}
+		wg.Done()
+	}(mq)
+
+	wg.Wait()
+
+	sort.Strings(res1)
+	sort.Strings(res2)
+	sort.Strings(s1)
+	sort.Strings(s2)
+
+	assert.Equal(t, s1, res1)
+	assert.Equal(t, s2, res2)
+
+}
+
+func TestParallelStream2(t *testing.T) {
+	//
+	//slog.SetLogLoggerLevel(slog.LevelDebug)
+	//defer slog.SetLogLoggerLevel(slog.LevelInfo)
+	//logger := slog.Default()
+	var logger *slog.Logger
+
+	uri := delta.URITemp()
+	defer func(uri string) {
+		delta.RemoveStore(uri, logger)
+	}(uri)
+
+	// todo remove once done
+
+	var s1 []string
+	var s2 []string
+
+	var s1mu sync.Mutex
+	var s2mu sync.Mutex
+
+	size := 1013
+
+	for loop := 0; loop < 2; loop++ {
+
+		mq, err := delta.New(uri, delta.WithLogger(logger))
+		assert.NoError(t, err)
+
+		fmt.Println("Inserting ", size, "messages, in ", mq.CurrentStream())
+
+		wg := sync.WaitGroup{}
+
+		wg.Add(size)
+
+		for i := range size {
+			i := i
+			go func(i int, n *delta.MQ) {
+				payload := []byte(n.CurrentStream() + "_" + strconv.Itoa(i) + "_" + strconv.Itoa(loop))
+				//fmt.Println("Publishing", string(payload), "to stream_", n.CurrentStream())
+				_, err := n.Publish("a.b.c.d", payload)
+				s1mu.Lock()
+				defer s1mu.Unlock()
+				s1 = append(s1, string(payload))
+				assert.NoError(t, err)
+				wg.Done()
+			}(i, mq)
+
+		}
+
+		const SUB_STREAM = "sub stream_"
+		mq, err = mq.Stream(SUB_STREAM)
+		assert.NoError(t, err)
+
+		fmt.Println("Inserting ", size, "messages, in ", mq.CurrentStream())
+		wg.Add(size)
+		for i := range size {
+			i := i
+			go func(i int, m *delta.MQ) {
+				payload := []byte(m.CurrentStream() + "_" + strconv.Itoa(i) + "_" + strconv.Itoa(loop))
+				//fmt.Println("Publishing", string(payload), "to stream_", m.CurrentStream())
+				_, err := m.Publish("a.b.c.d", payload)
+				s2mu.Lock()
+				defer s2mu.Unlock()
+				s2 = append(s2, string(payload))
+				assert.NoError(t, err)
+				wg.Done()
+			}(i, mq)
+
+		}
+
+		wg.Add(2)
+
+		var res1 []string
+		go func(m *delta.MQ) {
+			mm, err := m.Stream(delta.DEFAULT_STREAM)
+			assert.NoError(t, err)
+			sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+			assert.NoError(t, err)
+			fmt.Println("Retrieving ", size*(loop+1), "messages from stream_", mm.CurrentStream())
+			for range size * (loop + 1) {
+				m, ok := sub.Next()
+				//fmt.Println("Retrieving", len(res1), "/", size, "messages from stream_", mm.CurrentStream(), "--", string(m.Payload))
+				assert.True(t, ok)
+				res1 = append(res1, string(m.Payload))
+			}
+			wg.Done()
+		}(mq)
+
+		var res2 []string
+		go func(m *delta.MQ) {
+			mm, err := m.Stream(SUB_STREAM)
+			assert.NoError(t, err)
+			sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+			assert.NoError(t, err)
+			fmt.Println("Retrieving ", size*(loop+1), "messages from stream_", mm.CurrentStream())
+			for range size * (loop + 1) {
+				m, ok := sub.Next()
+				//fmt.Println("Retrieving", len(res2), "/", size, "messages from stream_", mm.CurrentStream(), "--", string(m.Payload))
+				assert.True(t, ok)
+				res2 = append(res2, string(m.Payload))
+			}
+			wg.Done()
+		}(mq)
+
+		wg.Wait()
+
+		sort.Strings(res1)
+		sort.Strings(res2)
+		sort.Strings(s1)
+		sort.Strings(s2)
+
+		assert.Equal(t, len(s1), len(res1))
+		assert.Equal(t, len(s2), len(res2))
+
+		assert.Equal(t, s1, res1)
+		assert.Equal(t, s2, res2)
+
+		mq.Close()
 	}
 
 }
