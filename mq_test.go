@@ -87,7 +87,7 @@ func TestSimplePubSub2(t *testing.T) {
 				assert.Fail(t, "timeout")
 			}
 
-			sub.Unsub()
+			sub.Unsubscribe()
 			doneWg.Done()
 		}()
 
@@ -139,7 +139,7 @@ func TestSimpleQueue(t *testing.T) {
 					break outer
 				}
 			}
-			sub.Unsub()
+			sub.Unsubscribe()
 			doneWg.Done()
 		}()
 
@@ -205,7 +205,7 @@ func TestSimpleSubFrom(t *testing.T) {
 
 	}
 
-	sub, err := mq.SubFrom("a.b.*.d", from)
+	sub, err := mq.SubscribeFrom("a.b.*.d", from)
 	assert.NoError(t, err)
 	fmt.Println("Retrieving ", size, "messages")
 	start := time.Now()
@@ -215,9 +215,9 @@ func TestSimpleSubFrom(t *testing.T) {
 		assert.Equal(t, string(res[i]), string(m.Payload), "i: %d", i)
 	}
 	fmt.Println("GLOB", "size", size, "time", time.Since(start), "per msg", time.Since(start)/time.Duration(size))
-	sub.Unsub()
+	sub.Unsubscribe()
 
-	sub, err = mq.SubFrom("a.b.c.d", from)
+	sub, err = mq.SubscribeFrom("a.b.c.d", from)
 	assert.NoError(t, err)
 	fmt.Println("Retrieving ", size, "messages")
 	start = time.Now()
@@ -253,7 +253,7 @@ func TestSimpleSubFrom_joininghistory_with_live(t *testing.T) {
 
 	}
 
-	sub, err := mq.SubFrom("a.b.*.d", from)
+	sub, err := mq.SubscribeFrom("a.b.*.d", from)
 	assert.NoError(t, err)
 	fmt.Println("Retrieving ", size, "messages")
 
@@ -265,7 +265,7 @@ func TestSimpleSubFrom_joininghistory_with_live(t *testing.T) {
 		assert.NoError(t, err)
 		res = append(res, ii)
 	}
-	sub.Unsub()
+	sub.Unsubscribe()
 
 	sort.Ints(res)
 
@@ -293,7 +293,7 @@ func TestSimpleSubFrom_joininghistory_with_live2(t *testing.T) {
 
 	}
 
-	sub, err := mq.SubFrom("a.b.*.d", from)
+	sub, err := mq.SubscribeFrom("a.b.*.d", from)
 	assert.NoError(t, err)
 	fmt.Println("Retrieving ", size, "messages")
 
@@ -305,7 +305,7 @@ func TestSimpleSubFrom_joininghistory_with_live2(t *testing.T) {
 		res = append(res, ii)
 		i++
 		if i == size {
-			sub.Unsub()
+			sub.Unsubscribe()
 		}
 	}
 
@@ -349,7 +349,7 @@ func TestSimpleStream(t *testing.T) {
 	mq, err = mq.Stream(delta.DEFAULT_STREAM)
 	assert.NoError(t, err)
 
-	sub, err := mq.SubFrom("a.b.*.d", from)
+	sub, err := mq.SubscribeFrom("a.b.*.d", from)
 	assert.NoError(t, err)
 	fmt.Println("Retrieving ", size, "messages from stream_", mq.CurrentStream())
 	for i := range size {
@@ -362,7 +362,7 @@ func TestSimpleStream(t *testing.T) {
 	mq, err = mq.Stream(SUB_STREAM)
 	assert.NoError(t, err)
 
-	sub, err = mq.SubFrom("a.b.c.d", from)
+	sub, err = mq.SubscribeFrom("a.b.c.d", from)
 	assert.NoError(t, err)
 	fmt.Println("Retrieving ", size, "messages from stream_", mq.CurrentStream())
 	for i := range size {
@@ -439,7 +439,7 @@ func TestParallelStream(t *testing.T) {
 	go func(m *delta.MQ) {
 		mm, err := m.Stream(delta.DEFAULT_STREAM)
 		assert.NoError(t, err)
-		sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+		sub, err := mm.SubscribeFrom("a.b.*.d", time.Time{})
 		assert.NoError(t, err)
 		fmt.Println("Retrieving ", size, "messages from stream_", mm.CurrentStream())
 		for range size {
@@ -455,7 +455,7 @@ func TestParallelStream(t *testing.T) {
 	go func(m *delta.MQ) {
 		mm, err := m.Stream(SUB_STREAM)
 		assert.NoError(t, err)
-		sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+		sub, err := mm.SubscribeFrom("a.b.*.d", time.Time{})
 		assert.NoError(t, err)
 		fmt.Println("Retrieving ", size, "messages from stream_", mm.CurrentStream())
 		for range size {
@@ -554,7 +554,7 @@ func TestParallelStream2(t *testing.T) {
 		go func(m *delta.MQ) {
 			mm, err := m.Stream(delta.DEFAULT_STREAM)
 			assert.NoError(t, err)
-			sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+			sub, err := mm.SubscribeFrom("a.b.*.d", time.Time{})
 			assert.NoError(t, err)
 			fmt.Println("Retrieving ", size*(loop+1), "messages from stream_", mm.CurrentStream())
 			for range size * (loop + 1) {
@@ -570,7 +570,7 @@ func TestParallelStream2(t *testing.T) {
 		go func(m *delta.MQ) {
 			mm, err := m.Stream(SUB_STREAM)
 			assert.NoError(t, err)
-			sub, err := mm.SubFrom("a.b.*.d", time.Time{})
+			sub, err := mm.SubscribeFrom("a.b.*.d", time.Time{})
 			assert.NoError(t, err)
 			fmt.Println("Retrieving ", size*(loop+1), "messages from stream_", mm.CurrentStream())
 			for range size * (loop + 1) {

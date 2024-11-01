@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+const (
+	OptimizeLatency = iota
+	OptimizeThroughput
+)
+
 const DEFAULT_STREAM = "default"
 
 func URITemp() string {

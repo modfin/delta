@@ -90,6 +90,8 @@ type stream_ struct {
 
 	writeMu sync.Mutex
 
+	inform chan struct{}
+
 	subs *globber[*Subscription]
 
 	groupMu sync.Mutex
@@ -143,9 +145,13 @@ func New(uri string, op ...Op) (*MQ, error) {
 			written: 0,
 			read:    0,
 
+			inform: make(chan struct{}),
+
 			subs: newGlobber[*Subscription](),
 
-			groups: map[string]*group{},
+			writeMu: sync.Mutex{},
+			groupMu: sync.Mutex{},
+			groups:  map[string]*group{},
 		},
 	}
 	c.base.streams[c.stream.name] = c
@@ -210,7 +216,11 @@ func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
 			name:    stream,
 			written: 0,
 			read:    0,
+
+			inform: make(chan struct{}),
+
 			writeMu: sync.Mutex{},
+
 			subs:    newGlobber[*Subscription](),
 			groupMu: sync.Mutex{},
 			groups:  map[string]*group{},
@@ -363,12 +373,13 @@ func (mq *MQ) write(m Msg) (Msg, error) {
 		return m, fmt.Errorf("could not persist, %w", err)
 	}
 
-	//go func() { // probably faster to remove this and have a righter sleep
-	//	select { // inform of new write
-	//	case mq.inform <- struct{}{}:
-	//	default:
-	//	}
-	//}()
+	// this is very slow, reduces throughput by a factor, from 10 000 msg/s to 1 000 msg/s
+	// good to reduce latency but not throughput.
+	// should probably allow for some option. this becomes useless if we are processing a lot of writes.
+	select {
+	case mq.stream.inform <- struct{}{}:
+	default:
+	}
 
 	if m.MessageId%1000 == 1000-1 {
 		err = ackWritten(mq.base.db, m.MessageId, mq.tbl)
@@ -403,8 +414,8 @@ func (mq *MQ) readloop() {
 			case <-mq.base.closed:
 				mq.base.log.Debug("[delta] reader, stopping loop", "stream_", mq.CurrentStream())
 				return
-			//case <-mq.inform: // probably faster to remove this and have a righter sleep
-			case <-time.After(50 * time.Millisecond):
+			case <-mq.stream.inform: // probably faster to remove this and have a righter sleep
+			case <-time.After(100 * time.Millisecond):
 			}
 
 			for {
@@ -446,7 +457,7 @@ func (mq *MQ) readloop() {
 				s := s
 				m := m
 				m.mq = mq
-				go s.notify(m) // TODO deap copy message? should it not be a go routine?
+				go s.notify(m) // TODO deap copy message? should it not be a go routine? then a pool of go routines?
 			}
 
 		}
@@ -508,9 +519,9 @@ func (mq *MQ) PublishAsync(topic string, payload []byte) *Publication {
 }
 
 type Subscription struct {
-	id    string
-	topic string
-	Unsub func()
+	id          string
+	topic       string
+	Unsubscribe func()
 
 	closeOnce  sync.Once
 	closed     bool
@@ -582,7 +593,7 @@ func (mq *MQ) Subscribe(topic string) (*Subscription, error) {
 		notifyChan: make(chan Msg),
 	}
 	mq.stream.subs.Insert(s)
-	s.Unsub = func() {
+	s.Unsubscribe = func() {
 		mq.stream.subs.Remove(s)
 		close(s.notifyChan)
 	}
@@ -659,7 +670,7 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 		notifyChan: make(chan Msg),
 	}
 
-	sub.Unsub = func() { // TODO can this produce a deadlock? between the main and the sub?
+	sub.Unsubscribe = func() { // TODO can this produce a deadlock? between the main and the sub?
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		close(sub.notifyChan)
@@ -672,7 +683,7 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 
 		if len(g.subs) == 0 {
 			mq.stream.groupMu.Lock()
-			g.main.Unsub()
+			g.main.Unsubscribe()
 			delete(mq.stream.groups, key)
 			mq.stream.groupMu.Unlock()
 		}
@@ -700,13 +711,13 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 		notifyChan: make(chan Msg),
 	}
 
-	s.Unsub = func() {
+	s.Unsubscribe = func() {
 		close(s.notifyChan)
 	}
 
 	go func() {
-		defer sub.Unsub()
-		defer s.Unsub()
+		defer sub.Unsubscribe()
+		defer s.Unsubscribe()
 
 		select {
 		case <-ctx.Done():
@@ -721,7 +732,7 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 
 }
 
-func (mq *MQ) SubFrom(topic string, from time.Time) (*Subscription, error) {
+func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error) {
 	topic, err := checkTopicSub(topic)
 	if err != nil {
 		return nil, fmt.Errorf("not a valid topic, %w", err)
@@ -739,7 +750,7 @@ func (mq *MQ) SubFrom(topic string, from time.Time) (*Subscription, error) {
 		notifyChan: make(chan Msg),
 	}
 
-	s.Unsub = func() {
+	s.Unsubscribe = func() {
 		mq.stream.subs.Remove(buffer)
 		buffer.close()
 	}
