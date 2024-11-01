@@ -202,10 +202,30 @@ for i := 10; i < 20; i++ {
     fmt.Println("Received historic message:", string(msg.Payload))
 }
 
-}
+```
+
+## Benchmarks
+
+Some benchmarks, but remember, generic benchmarks are shit :) Anyway, it seems it performs decently.
+It fans out with very little overhead and seems and writes per second seems to be pretty stable (since its singe threaded.).  
+
+```text
+
+// Performed with waking up readers, which takes a performance hit on writers.
+
+BenchmarkMultipleSubscribers/1-22                     8_242 read-msg/s    9_196 write-msg/s
+BenchmarkMultipleSubscribers/4-22                    31_810 read-msg/s    8_037 write-msg/s
+BenchmarkMultipleSubscribers/num-cpu_(22)-22        212_433 read-msg/s    9_774 write-msg/s
+BenchmarkMultipleSubscribers/2x_num-cpu_(44)-22     411_696 read-msg/s    9_631 write-msg/s
+
+
+BenchmarkMultipleSubscribersSize/_0.1mb-22   1_313 read-MB/s     13_130 read-msg/s     59.7 write-MB/s     597.3 write-msg/s
+BenchmarkMultipleSubscribersSize/_1.0mb-22   3_517 read-MB/s      3_517 read-msg/s    160.6 write-MB/s     160.6 write-msg/s
+BenchmarkMultipleSubscribersSize/10.0mb-22   3_856 read-MB/s        386 read-msg/s    184.5 write-MB/s      18.5 write-msg/s
+
 ```
 
 
-## License**
-**
+## License
+
 This project is licensed under the MIT License. See the `LICENSE` file for details.

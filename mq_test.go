@@ -599,3 +599,119 @@ func TestParallelStream2(t *testing.T) {
 	}
 
 }
+
+func TestMultipleSubscriptions(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	var subWg sync.WaitGroup
+	var doneWg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		subWg.Add(1)
+		doneWg.Add(1)
+		go func() {
+			sub, err := mq.Subscribe("a.b.*.d")
+			assert.NoError(t, err)
+
+			subWg.Done()
+
+			select {
+			case m := <-sub.Chan():
+				assert.Equal(t, "hello", string(m.Payload))
+			case <-time.After(5 * time.Second):
+				assert.Fail(t, "timeout")
+			}
+			doneWg.Done()
+		}()
+	}
+
+	subWg.Wait()
+
+	_, err = mq.Publish("a.b.c.d", []byte("hello"))
+	assert.NoError(t, err)
+
+	doneWg.Wait()
+}
+
+func TestUnsubscribe(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	sub, err := mq.Subscribe("a.b.*.d")
+	assert.NoError(t, err)
+
+	sub.Unsubscribe()
+
+	_, err = mq.Publish("a.b.c.d", []byte("hello"))
+	assert.NoError(t, err)
+
+	select {
+	case _, ok := <-sub.Chan():
+		if ok {
+			assert.Fail(t, "should not receive message after unsubscribe")
+		}
+	}
+}
+
+func TestPublishAsync(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	sub, err := mq.Subscribe("a.b.*.d")
+	assert.NoError(t, err)
+
+	pub := mq.PublishAsync("a.b.c.d", []byte("hello"))
+	<-pub.Done()
+
+	select {
+	case m := <-sub.Chan():
+		assert.Equal(t, "hello", string(m.Payload))
+	case <-time.After(5 * time.Second):
+		assert.Fail(t, "timeout")
+	}
+}
+
+func TestQueueMultipleConsumers(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	var subWg sync.WaitGroup
+	var doneWg sync.WaitGroup
+	var counter int64
+
+	for i := 0; i < 5; i++ {
+		subWg.Add(1)
+		doneWg.Add(1)
+		go func() {
+			sub, err := mq.Queue("a.*", "test")
+			assert.NoError(t, err)
+			subWg.Done()
+
+			for {
+				select {
+				case m := <-sub.Chan():
+					assert.Equal(t, "hello queue", string(m.Payload))
+					atomic.AddInt64(&counter, 1)
+				case <-time.After(1 * time.Second):
+					sub.Unsubscribe()
+					doneWg.Done()
+					return
+				}
+			}
+		}()
+	}
+
+	subWg.Wait()
+
+	for i := 0; i < 10; i++ {
+		_, err = mq.Publish("a.b", []byte("hello queue"))
+		assert.NoError(t, err)
+	}
+
+	doneWg.Wait()
+	assert.Equal(t, int64(10), counter)
+}
