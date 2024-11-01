@@ -48,7 +48,7 @@ func main() {
 
 ### Pub/Sub
 
-The publish/subscribe messaging pattern allows multiple subscribers to receive messages from a topic.
+The publish/subscribe messaging pattern allows multiple subscribers to receive messages from a topic, "One to many" or broadcasting
 
 [![](https://mermaid.ink/img/pako:eNptjrEKgzAQhl8l3FRBB9vNoVC0nTqU2jFLjKcGEiMxoZTouzdSCxV6t9x9_8dxHriuETJopH7yjhlLrnfak1An72-ukmLs0MzzykiSHMmkxjadSL7bPfQgeBR9wvw3LLwvXTVyIyo0JP0e2DjnjbP_61w2zmFxliYEYlBoFBN1-N4vhILtUCGFLIw1NsxJS4H2c1CZs7p89RwyaxzGYLRrO8gaJsewuaFmFgvBWsPUSuc3JgZclg?type=png)](https://mermaid.live/edit#pako:eNptjrEKgzAQhl8l3FRBB9vNoVC0nTqU2jFLjKcGEiMxoZTouzdSCxV6t9x9_8dxHriuETJopH7yjhlLrnfak1An72-ukmLs0MzzykiSHMmkxjadSL7bPfQgeBR9wvw3LLwvXTVyIyo0JP0e2DjnjbP_61w2zmFxliYEYlBoFBN1-N4vhILtUCGFLIw1NsxJS4H2c1CZs7p89RwyaxzGYLRrO8gaJsewuaFmFgvBWsPUSuc3JgZclg)
 
@@ -72,9 +72,7 @@ Example might be `location.*` will match `location.us`, `location.eu` etc. but n
 can use `**` which basically translates to prefix match, eg `location.**` will match `location.us`, `location.us.new-york`, `location.us.new-york.new-york-city` and so on.
 
 
-```go
-
-This can be done using a chan
+This can be done using a chan or by using the `Next` method which will block until a message is received or subscription is closed .
 
 ```go
 sub, err := mq.Subscribe("a.b.*.d")
@@ -110,7 +108,10 @@ for i := 0; i < 3; i++ {
 
     go func() {
         for msg := range sub.Chan() {
-            fmt.Printf("Received message from queue by worker %d: %s\n", i, string(msg.Payload))
+            fmt.Printf("Received message from queue by worker %d: %s\n", 
+				i, 
+				string(msg.Payload),
+			)
         }
     }()
 }
@@ -127,7 +128,8 @@ The request/reply messaging pattern allows a client to send a request to a servi
 ```go
 
 // test is the name of the queue which is used to identify it
-// it is important to use a queue group to ensure that the request is not hadled by multiple workers
+// it is important to use a queue group to ensure that the request is 
+//not hadled by multiple workers
 for i := 0; i < 3; i++ {
     i:= i
     sub, err := mq.Queue("greet.*", "test") 
@@ -137,7 +139,7 @@ for i := 0; i < 3; i++ {
     go func() {
         for msg := range sub.Chan() {
             _, name, _ := strings.Cut(msg.Topic, ".")
-            _, err := msg.Reply([]byte("hello " + name))
+            _, err := msg.Reply([]byte(fmt.Sprintf("from worker %d > hello %s, ", i, name))
             if err != nil {
                 panic(err)
             }
@@ -156,6 +158,54 @@ if ok {
 }
 ```
 
-## License
 
+
+### Subscription From
+
+The `SubscribeFrom` method allows you to subscribe to messages from a specific topic starting from a given historical time. This is useful when you want to process messages that were published after a certain point in time or you want to re-process messages.
+
+#### Example Usage
+
+```go
+
+// Publish some messages
+for i := 0; i < 10; i++ {
+    payload := []byte("message " + strconv.Itoa(i))
+    _, err := mq.Publish("example.topic", payload)
+    if err != nil {
+        panic(err)
+    }
+}
+
+// Subscribe from a specific time
+from := time.Now()
+
+// Publish more messages
+for i := 10; i < 20; i++ {
+    payload := []byte("message " + strconv.Itoa(i))
+    _, err := mq.Publish("example.topic", payload)
+    if err != nil {
+        panic(err)
+    }
+}
+
+sub, err := mq.SubscribeFrom("example.topic", from)
+if err != nil {
+    panic(err)
+}
+// Read messages from the subscription
+for i := 10; i < 20; i++ {
+    msg, ok := sub.Next()
+    if !ok {
+        panic("failed to read message")
+    }
+    fmt.Println("Received historic message:", string(msg.Payload))
+}
+
+}
+```
+
+
+## License**
+**
 This project is licensed under the MIT License. See the `LICENSE` file for details.
