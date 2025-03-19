@@ -4,7 +4,6 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
-	"github.com/modfin/henry/slicez"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -127,12 +126,12 @@ func checkTopic(topic string) (string, error) {
 	//return topic, nil
 
 	parts := splitTopic(topic)
-	parts = slicez.Map(parts, func(p string) string {
-		if strings.Contains(p, ".") {
-			return "{" + p + "}"
+
+	for i := range parts {
+		if strings.Contains(parts[i], ".") {
+			parts[i] = "{" + parts[i] + "}"
 		}
-		return p
-	})
+	}
 	return strings.Join(parts, "."), nil
 }
 
