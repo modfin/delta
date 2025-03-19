@@ -715,3 +715,148 @@ func TestQueueMultipleConsumers(t *testing.T) {
 	doneWg.Wait()
 	assert.Equal(t, int64(10), counter)
 }
+
+func TestStrangeTopicPubSub(t *testing.T) {
+
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := sync.WaitGroup{}
+	done := sync.WaitGroup{}
+	start.Add(1)
+	done.Add(1)
+	go func() {
+		sub, err := mq.Subscribe("email.{a.email.with.dots@example.com}")
+		assert.NoError(t, err)
+		start.Done()
+
+		m := <-sub.Chan()
+		t.Log("got message", string(m.Payload), "from 1", "at", m.Topic)
+		assert.Equal(t, "hello", string(m.Payload))
+
+		done.Done()
+	}()
+
+	start.Wait()
+	_, err = mq.Publish("email.{a.email.with.dots@example.com}", []byte("hello"))
+	assert.NoError(t, err)
+
+	done.Wait()
+
+}
+
+func TestEscapedTopicPubSub(t *testing.T) {
+
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := sync.WaitGroup{}
+	done := sync.WaitGroup{}
+	start.Add(2)
+	done.Add(2)
+	go func() {
+		sub, err := mq.Subscribe("a.{topic}")
+		assert.NoError(t, err)
+		start.Done()
+
+		m := <-sub.Chan()
+		t.Log("got message", string(m.Payload), "from 1", "at", m.Topic)
+		assert.Equal(t, "hello1", string(m.Payload))
+
+		m = <-sub.Chan()
+		t.Log("got message", string(m.Payload), "from 1", "at", m.Topic)
+		assert.Equal(t, "hello2", string(m.Payload))
+
+		done.Done()
+	}()
+
+	go func() {
+		sub, err := mq.Subscribe("a.topic")
+		assert.NoError(t, err)
+		start.Done()
+
+		m := <-sub.Chan()
+		t.Log("got message", string(m.Payload), "from 2", "at", m.Topic)
+		assert.Equal(t, "hello1", string(m.Payload))
+
+		m = <-sub.Chan()
+		t.Log("got message", string(m.Payload), "from 2", "at", m.Topic)
+		assert.Equal(t, "hello2", string(m.Payload))
+
+		done.Done()
+	}()
+	//
+	start.Wait()
+	t.Log("publishing", "hello1", "to a.{topic}")
+	_, err = mq.Publish("a.{topic}", []byte("hello1"))
+	assert.NoError(t, err)
+
+	t.Log("publishing", "hello2", "to a.topic")
+	_, err = mq.Publish("a.topic", []byte("hello2"))
+	assert.NoError(t, err)
+	done.Wait()
+
+}
+
+func TestEscapedTopicPubSubFrom(t *testing.T) {
+
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := time.Now().Add(-1 * time.Hour)
+
+	t.Log("pre publishing", "escaped-pre", "to a.{topic}")
+	_, err = mq.Publish("a.{topic}", []byte("escaped-pre"))
+	assert.NoError(t, err)
+
+	t.Log("pre publishing", "unescaped-pre", "to a.topic")
+	_, err = mq.Publish("a.topic", []byte("unescaped-pre"))
+	assert.NoError(t, err)
+
+	wgstart := sync.WaitGroup{}
+	wgdone := sync.WaitGroup{}
+	for i, tt := range []string{"a.{topic}", "a.topic"} {
+		wgstart.Add(1)
+		wgdone.Add(1)
+		go func(i int, topic string) {
+			defer wgdone.Done()
+
+			t.Log("goroutine", i, "sub", topic, "subscribed")
+			sub, err := mq.SubscribeFrom(topic, start)
+			assert.NoError(t, err)
+			wgstart.Done()
+
+			m := <-sub.Chan()
+			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
+			assert.Equal(t, "escaped-pre", string(m.Payload))
+
+			m = <-sub.Chan()
+			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
+			assert.Equal(t, "unescaped-pre", string(m.Payload))
+
+			m = <-sub.Chan()
+			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
+			assert.Equal(t, "escaped-post", string(m.Payload))
+
+			m = <-sub.Chan()
+			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
+			assert.Equal(t, "unescaped-post", string(m.Payload))
+
+		}(i, tt)
+	}
+
+	wgstart.Wait()
+
+	t.Log("post publishing", "escaped-post", "to a.{topic}")
+	_, err = mq.Publish("a.{topic}", []byte("escaped-post"))
+	assert.NoError(t, err)
+
+	t.Log("post publishing", "unescaped-post", "to a.topic")
+	_, err = mq.Publish("a.topic", []byte("unescaped-post"))
+	assert.NoError(t, err)
+
+	wgdone.Wait()
+}

@@ -488,7 +488,7 @@ func (mq *MQ) Publish(topic string, payload []byte) (*Publication, error) {
 	}
 	close(pub.done)
 
-	topic, err := checkTopicPub(topic)
+	topic, err := checkTopic(topic)
 	if err != nil {
 		pub.Err = fmt.Errorf("not a valid topic, %w", err)
 		return nil, pub.Err
@@ -582,7 +582,7 @@ func (s *Subscription) Next() (Msg, bool) {
 func (mq *MQ) Subscribe(topic string) (*Subscription, error) {
 	uid := uid()
 
-	topic, err := checkTopicSub(topic)
+	topic, err := checkTopic(topic)
 	if err != nil {
 		return nil, fmt.Errorf("not a valid topic, %w", err)
 	}
@@ -609,7 +609,7 @@ type group struct {
 
 func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 
-	topic, err := checkTopicSub(topic)
+	topic, err := checkTopic(topic)
 	if err != nil {
 		return nil, fmt.Errorf("not a valid topic, %w", err)
 	}
@@ -733,7 +733,7 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 }
 
 func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error) {
-	topic, err := checkTopicSub(topic)
+	topic, err := checkTopic(topic)
 	if err != nil {
 		return nil, fmt.Errorf("not a valid topic, %w", err)
 	}
@@ -756,7 +756,6 @@ func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error)
 	}
 
 	go func() {
-
 		mq.stream.subs.Insert(buffer)
 		splitt := atomic.LoadUint64(&mq.stream.written)
 

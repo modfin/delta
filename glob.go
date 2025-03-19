@@ -2,13 +2,12 @@ package delta
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 )
 
 func globMatcher(topic, glob string) (bool, error) {
-	globParts := strings.Split(glob, ".")
-	topicParts := strings.Split(topic, ".")
+	globParts := splitTopic(glob)
+	topicParts := splitTopic(topic)
 
 	l := min(len(globParts), len(topicParts))
 	for i := 0; i < l; i++ {
@@ -47,7 +46,7 @@ func newGlobber[T globbable]() *globber[T] {
 func (t *globber[T]) Insert(sub T) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	parts := strings.Split(sub.Topic(), ".")
+	parts := splitTopic(sub.Topic())
 	node := t
 	for _, part := range parts {
 
@@ -66,7 +65,7 @@ func (t *globber[T]) Insert(sub T) {
 func (t *globber[T]) Remove(tbr T) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	parts := strings.Split(tbr.Topic(), ".")
+	parts := splitTopic(tbr.Topic())
 	node := t
 	var nodes []*globber[T]
 
@@ -111,7 +110,7 @@ func (t *globber[T]) Print() {
 func (t *globber[T]) Match(topic string) []T {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	parts := strings.Split(topic, ".")
+	parts := splitTopic(topic)
 	return t.matchRecursive(parts)
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
+	"github.com/modfin/henry/slicez"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -54,48 +55,85 @@ func checkStreamName(stream string) (string, error) {
 	return stream, nil
 }
 
-func checkTopicPub(topic string) (string, error) {
-	topic = strings.TrimSpace(topic)
-	topic = strings.ToLower(topic)
-	if len(topic) == 0 {
-		return "", fmt.Errorf("topic is empty")
+func splitTopic(topic string) []string {
+	var groups []string
+	var currentGroup strings.Builder
+	var depth int
+	var inGroup bool
+
+	// Extract groups by iterating through characters
+	for _, char := range topic {
+		if char == '{' {
+			depth++
+			if depth == 1 {
+				inGroup = true
+				continue // Skip the opening brace for the group content
+			}
+		}
+		if inGroup && char == '}' {
+			depth--
+			if depth == 0 {
+				groups = append(groups, currentGroup.String())
+				currentGroup.Reset()
+				inGroup = false
+				continue // Skip the closing brace
+			}
+		}
+		if inGroup {
+			currentGroup.WriteRune(char)
+		}
 	}
-	for _, r := range topic {
-		if 'a' <= r && r <= 'z' {
-			continue
-		}
-		if '0' <= r && r <= '9' {
-			continue
-		}
-		switch r {
-		case '-', '_', '.':
-			continue
-		}
-		return "", fmt.Errorf("topic contains invalid character, only a-z, -, _, . are allowed, got %c", r)
+
+	modifiedTopic := topic
+
+	if inGroup { // Add the last unclosed group
+		groups = append(groups, currentGroup.String())
+		currentGroup.Reset()
+		inGroup = false
+		depth = 0
+		modifiedTopic += "}"
 	}
-	return topic, nil
+
+	// Replace groups with placeholders
+	for _, group := range groups {
+		modifiedTopic = strings.Replace(modifiedTopic, "{"+group+"}", "{}", 1)
+	}
+
+	// Split by dots
+	parts := strings.Split(modifiedTopic, ".")
+
+	// Replace placeholders with actual groups
+	if len(groups) > 0 {
+		groupIndex := 0
+		for i := range parts {
+			for strings.Contains(parts[i], "{}") && groupIndex < len(groups) {
+				parts[i] = strings.Replace(parts[i], "{}", groups[groupIndex], 1)
+				groupIndex++
+			}
+		}
+	}
+
+	return parts
 }
 
-func checkTopicSub(topic string) (string, error) {
+func checkTopic(topic string) (string, error) {
 	topic = strings.TrimSpace(topic)
+	topic = strings.Trim(topic, ".")
 	topic = strings.ToLower(topic)
 	if len(topic) == 0 {
 		return "", fmt.Errorf("topic is empty")
 	}
-	for _, r := range topic {
-		if 'a' <= r && r <= 'z' {
-			continue
+	// TODO check that there are other things then .
+	//return topic, nil
+
+	parts := splitTopic(topic)
+	parts = slicez.Map(parts, func(p string) string {
+		if strings.Contains(p, ".") {
+			return "{" + p + "}"
 		}
-		if '0' <= r && r <= '9' {
-			continue
-		}
-		switch r {
-		case '-', '_', '.', '*':
-			continue
-		}
-		return "", fmt.Errorf("topic contains invalid character, only a-z, -, _, ., * are allowed, got %c", r)
-	}
-	return topic, nil
+		return p
+	})
+	return strings.Join(parts, "."), nil
 }
 
 var uid_count uint32
