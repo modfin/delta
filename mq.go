@@ -58,6 +58,15 @@ func WithLogger(log *slog.Logger) Op {
 	}
 }
 
+// WithVacuum sets the logger for the cache
+func WithVacuum(vacuum VacuumFunc, interval time.Duration) Op {
+	return func(c *MQ) error {
+		c.base.vacuum = vacuum
+		c.base.vacuumInterval = interval
+		return nil
+	}
+}
+
 func dbDefault() Op {
 	return func(c *MQ) error {
 		return errors.Join(
@@ -69,6 +78,7 @@ func dbDefault() Op {
 	}
 }
 
+type VacuumFunc func(*MQ)
 type base_ struct {
 	//shards
 	uri string
@@ -80,6 +90,9 @@ type base_ struct {
 	log           *slog.Logger
 	streamMu      sync.Mutex
 	streams       map[string]*MQ
+
+	vacuumInterval time.Duration
+	vacuum         VacuumFunc
 }
 
 type stream_ struct {
@@ -189,6 +202,7 @@ func New(uri string, op ...Op) (*MQ, error) {
 	atomic.SwapUint64(&c.stream.read, read) // Probably load some sort of read counter instead?
 
 	c.readloop()
+	c.vacuumloop()
 
 	return c, nil
 }
@@ -392,6 +406,32 @@ func (mq *MQ) write(m Msg) (Msg, error) {
 
 }
 
+func (mq *MQ) vacuumloop() {
+	go func() {
+		if mq.base.vacuum == nil {
+			mq.base.log.Info("[delta] vacuuming disabled")
+			return
+		}
+		if mq.base.vacuumInterval < 100*time.Millisecond {
+			mq.base.vacuumInterval = 100 * time.Millisecond
+		}
+		sleep := mq.base.vacuumInterval
+		vacuum := mq.base.vacuum
+
+		mq.base.log.Info("[delta] starting vacuum loop", "interval", sleep)
+		for {
+			select {
+			case <-mq.base.closed:
+				return
+			case <-time.After(sleep):
+				vacuum(mq)
+				for _, stream := range mq.base.streams {
+					vacuum(stream)
+				}
+			}
+		}
+	}()
+}
 func (mq *MQ) readloop() {
 	mq.base.log.Debug("[delta] starting loop", "stream_", mq.CurrentStream())
 	var size = max(uint64(runtime.NumCPU()), 4)
@@ -404,6 +444,8 @@ func (mq *MQ) readloop() {
 
 			if dirty {
 				dirty = false
+				// TODO ack read is great and all, but for a vacuum, we might end up in a place where we delete a message
+				// prior to it being read by the consumer.
 				err := ackRead(mq.base.db, atomic.LoadUint64(&mq.stream.read), mq.tbl)
 				if err != nil {
 					mq.base.log.Error("[delta] could not ack read", "err", err, "stream_", mq.CurrentStream())
@@ -414,7 +456,7 @@ func (mq *MQ) readloop() {
 			case <-mq.base.closed:
 				mq.base.log.Debug("[delta] reader, stopping loop", "stream_", mq.CurrentStream())
 				return
-			case <-mq.stream.inform: // probably faster to remove this and have a righter sleep
+			case <-mq.stream.inform: // probably faster to remove this and have a tighter sleep
 			case <-time.After(100 * time.Millisecond):
 			}
 
@@ -459,7 +501,6 @@ func (mq *MQ) readloop() {
 				m.mq = mq
 				go s.notify(m) // TODO deap copy message? should it not be a go routine? then a pool of go routines?
 			}
-
 		}
 	}
 

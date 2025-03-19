@@ -860,3 +860,103 @@ func TestEscapedTopicPubSubFrom(t *testing.T) {
 
 	wgdone.Wait()
 }
+
+func TestWithVacuum(t *testing.T) {
+
+	mq, err := delta.New(delta.URITemp(),
+		delta.DBRemoveOnClose(),
+		delta.WithLogger(slog.Default()),
+	)
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := time.Now()
+
+	// Publish some messages
+	for i := 0; i < 100; i++ {
+		_, err := mq.Publish("test.topic", []byte(fmt.Sprintf("message %d", i)))
+		assert.NoError(t, err)
+	}
+	// Wait for producer loop to ack message
+	time.Sleep(500 * time.Millisecond)
+
+	sub, err := mq.SubscribeFrom("test.topic", start)
+	assert.NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		select {
+		case m := <-sub.Chan():
+			assert.Equal(t, fmt.Sprintf("message %d", i), string(m.Payload))
+		}
+
+	}
+	sub.Unsubscribe()
+
+	l := 10
+	delta.VacuumKeepN(l)(mq)
+
+	sub, err = mq.SubscribeFrom("test.*", start)
+	assert.NoError(t, err)
+
+	for i := 100 - l; i < 100; i++ {
+		m := <-sub.Chan()
+		//t.Log("got message", string(m.Payload), "count", i)
+		assert.Equal(t, fmt.Sprintf("message %d", i), string(m.Payload))
+	}
+
+	select {
+	case m := <-sub.Chan():
+		t.Fatal("unexpected message", m)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	sub.Unsubscribe()
+
+}
+
+func TestWithVacuumLoop(t *testing.T) {
+
+	mq, err := delta.New(delta.URITemp(),
+		delta.DBRemoveOnClose(),
+		delta.WithVacuum(delta.VacuumOnAge(1*time.Second), 300*time.Millisecond),
+		//delta.WithLogger(slog.Default()),
+	)
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := time.Now()
+
+	// Publish some messages
+	for i := 0; i < 100; i++ {
+		_, err := mq.Publish("test.topic", []byte(fmt.Sprintf("message %d", i)))
+		assert.NoError(t, err)
+	}
+	// Wait for producer loop to ack message
+	time.Sleep(500 * time.Millisecond)
+
+	sub, err := mq.SubscribeFrom("test.topic", start)
+	assert.NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		select {
+		case m := <-sub.Chan():
+			assert.Equal(t, fmt.Sprintf("message %d", i), string(m.Payload))
+		}
+
+	}
+	sub.Unsubscribe()
+
+	time.Sleep(1 * time.Second)
+
+	sub, err = mq.SubscribeFrom("test.*", start)
+	assert.NoError(t, err)
+
+	select {
+	case m := <-sub.Chan():
+		t.Fatal("unexpected message", m)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	sub.Unsubscribe()
+
+}

@@ -95,6 +95,70 @@ func persist(db query, m Msg, tbl func() string) error {
 	return err
 }
 
+func vacuumReadAck(db query, tbl func() string) (int64, error) {
+	table := tbl()
+	q := fmt.Sprintf(`
+	DELETE FROM %s 
+    WHERE message_id < (
+        SELECT CAST("value" as BIGINT )  
+        FROM _mq_delta_metadata 
+        WHERE "key" = ($1 || '_read')
+    ) 
+    `, table)
+
+	r, err := db.Exec(q, table)
+
+	if err != nil {
+		return 0, err
+	}
+
+	return r.RowsAffected()
+}
+
+func vacuumBefore(db query, before time.Time, tbl func() string) (int64, error) {
+	table := tbl()
+	q := fmt.Sprintf(`
+	DELETE FROM %s 
+    WHERE created_at < $1
+	AND message_id < (
+		SELECT CAST("value" as BIGINT )
+		FROM _mq_delta_metadata 
+		WHERE "key" = ($2 || '_read')
+    )
+    `, table)
+
+	r, err := db.Exec(q, before.UnixNano(), table)
+	if err != nil {
+		return 0, err
+	}
+
+	return r.RowsAffected()
+}
+
+func vacuumKeep(db query, keep int, tbl func() string) (int64, error) {
+	table := tbl()
+	q := fmt.Sprintf(`
+	DELETE FROM %s 
+    WHERE message_id NOT IN (
+	    SELECT message_id FROM %s 
+	    ORDER BY message_id DESC
+	    LIMIT $1
+    )
+    AND message_id < (
+		SELECT CAST("value" as BIGINT )
+		FROM _mq_delta_metadata 
+		WHERE "key" = ($2 || '_read')
+    )
+    `, table, table)
+
+	r, err := db.Exec(q, keep, table)
+	if err != nil {
+		return 0, err
+	}
+
+	return r.RowsAffected()
+}
+
 func message(db *sql.DB, id uint64, tbl func() string) (Msg, error) {
 	var m Msg
 
