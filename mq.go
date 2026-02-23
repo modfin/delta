@@ -634,9 +634,12 @@ func (mq *MQ) Subscribe(topic string) (*Subscription, error) {
 		notifyChan: make(chan Msg),
 	}
 	mq.stream.subs.Insert(s)
+	var unsubOnce sync.Once
 	s.Unsubscribe = func() {
-		mq.stream.subs.Remove(s)
-		close(s.notifyChan)
+		unsubOnce.Do(func() {
+			mq.stream.subs.Remove(s)
+			close(s.notifyChan)
+		})
 	}
 
 	return s, nil
@@ -752,8 +755,11 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 		notifyChan: make(chan Msg),
 	}
 
+	var unsubOnce sync.Once
 	s.Unsubscribe = func() {
-		close(s.notifyChan)
+		unsubOnce.Do(func() {
+			close(s.notifyChan)
+		})
 	}
 
 	go func() {
@@ -817,8 +823,9 @@ func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error)
 		itr := iterMessage(mq.base.db, s.topic, from, splitt, mq.tbl, mq.base.log)
 		for m := range itr {
 			s.notify(m)
-			m.At = last
+			last = m.At
 		}
+		_ = last // last seen timestamp, available for future retry/resume logic
 		start.Done()
 	}()
 

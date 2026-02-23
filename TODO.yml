@@ -1,0 +1,233 @@
+- id: 1
+  name: Topic character validation
+  description: >
+    checkTopic() in util.go:118-136 only checks for emptiness. Any characters including
+    control chars, null bytes, and SQL-special characters are allowed. Add an allowlist
+    like [a-zA-Z0-9._*{}] to prevent latent injection risks if future code interpolates topics.
+  status: pending
+
+- id: 2
+  name: Deadlock in notify()
+  description: >
+    mq.go:596-598 has a blocking send on notifyChan while holding notifyMu.RLock(), which
+    prevents close() from acquiring the write lock. The author is aware (TODO comment).
+    Consider using a buffered channel or select with a default/timeout.
+  status: pending
+
+- id: 3
+  name: Data race in Close() and vacuumloop()
+  description: >
+    Close() at mq.go:295 and vacuumloop() at mq.go:428 iterate base.streams without
+    holding streamMu. Concurrent Stream() calls can mutate the map, causing a data race.
+    Lock streamMu (read lock) before iterating.
+  status: pending
+
+- id: 4
+  name: Double-unsubscribe panic
+  description: >
+    Subscribe() at mq.go:637-640 and Request() at mq.go:755-757 set Unsubscribe closures
+    that call close(channel) without sync.Once protection. Calling Unsubscribe() twice
+    panics. The internal close() method already uses sync.Once correctly -- apply the same
+    pattern here.
+  status: done
+
+- id: 5
+  name: DB connection leak in New() error paths
+  description: >
+    In New() at mq.go:132-208, after sql.Open succeeds, if any subsequent step fails
+    (Ping, pragmas, schema, optimize, metrics), the function returns an error without
+    closing the database. Add a deferred db.Close() on error using a named return or
+    cleanup variable.
+  status: pending
+
+- id: 6
+  name: DB connection leak in Close() error paths
+  description: >
+    In Close() at mq.go:295-308, if ackWritten or metrics fails for any stream, the
+    function returns early without calling db.Close(). Use defer c.base.db.Close() or
+    collect errors and always close.
+  status: pending
+
+- id: 7
+  name: Stale stream on Stream() error
+  description: >
+    In Stream() at mq.go:243-256, a partially-initialized stream is added to the streams
+    map before schema/ops are applied. On failure, it remains in the map. Move the map
+    insertion to after successful initialization.
+  status: pending
+
+- id: 8
+  name: Goroutine leak in Request() on context cancellation
+  description: >
+    In Request() at mq.go:759-770, if context is cancelled and the user stops reading
+    from s.Chan(), s.notify() blocks forever. Use a select with ctx.Done() inside notify
+    or use tryNotify instead.
+  status: pending
+
+- id: 9
+  name: No panic recovery in background goroutines
+  description: >
+    The read loop producer/consumers, vacuum loop, queue distributor, and SubscribeFrom
+    goroutines have no recover(). A panic in any of them crashes the entire process. Add
+    deferred recover() with logging to each background goroutine.
+  status: pending
+
+- id: 10
+  name: globMatcher matches too broadly
+  description: >
+    In glob.go:8-25, globMatcher returns true when the topic has more parts than the glob
+    pattern (unless ** is used). A subscription to "a.b" incorrectly receives messages for
+    "a.b.c". The function should return false when len(topicParts) != len(globParts) and
+    no ** wildcard is present.
+  status: done
+
+- id: 11
+  name: discardLogger.Enabled() returns true
+  description: >
+    In log.go:10-12, the discard logger's Enabled() method returns true. It should return
+    false to short-circuit log argument formatting and avoid wasted CPU.
+  status: pending
+
+- id: 12
+  name: Temp directory permissions too open
+  description: >
+    URITemp() in util.go:25 creates directories with 0755 permissions. Should use 0700
+    to prevent other system users from reading directory listings.
+  status: pending
+
+- id: 13
+  name: MkdirAll errors silently discarded
+  description: >
+    URITemp() at util.go:25 and URIFromPath() at util.go:30 discard os.MkdirAll errors.
+    If directory creation fails, the subsequent db open fails with a confusing error.
+    Propagate the error.
+  status: pending
+
+- id: 14
+  name: RemoveStore errors on missing WAL/SHM files
+  description: >
+    In mq.go:327-331, errors.Join combines errors from removing the main file, SHM, and
+    WAL files. If WAL or SHM files don't exist (common after clean shutdown), the function
+    returns an error. Use os.IsNotExist to filter expected absences.
+  status: pending
+
+- id: 15
+  name: Dead assignment m.At = last in SubscribeFrom
+  description: >
+    In mq.go:820, "m.At = last" overwrites the message timestamp with a zero time.Time.
+    Should be "last = m.At" to track the last-seen timestamp.
+  status: done
+
+- id: 16
+  name: Stale "cove" references in db.go
+  description: >
+    Error messages at db.go:209, 212, 230 reference "[cove] iterKV" instead of "[delta]".
+    Leftover from a prior project name. Update to "[delta]".
+  status: pending
+
+- id: 17
+  name: Test VacuumOnReadAck
+  description: >
+    VacuumOnReadAck has 0% test coverage. It is an entire vacuum strategy that is never
+    exercised by any test. Add a test similar to TestWithVacuum that configures
+    VacuumOnReadAck and verifies messages are deleted after being read.
+  status: pending
+
+- id: 18
+  name: Test DBSyncOff
+  description: >
+    DBSyncOff() has 0% coverage in tests. It is only exercised in benchmarks, which are
+    not included in standard coverage runs. Add a test that creates an MQ with DBSyncOff
+    and verifies it functions correctly.
+  status: pending
+
+- id: 19
+  name: Test URIFromPath
+  description: >
+    URIFromPath() is never called in any test. Add tests covering valid paths, paths
+    with spaces, and paths requiring directory creation.
+  status: pending
+
+- id: 20
+  name: Test New() error paths
+  description: >
+    All 5 error paths in New() after sql.Open are untested (Ping failure, Op failure,
+    schema failure, optimize failure, metrics failure). Add tests with invalid URIs and
+    failing Ops to exercise these paths.
+  status: pending
+
+- id: 21
+  name: Test Stream() with invalid names
+  description: >
+    The checkStreamName error path in Stream() is never exercised. Add tests with invalid
+    characters, empty names, and special characters to verify rejection.
+  status: pending
+
+- id: 22
+  name: Test public API with invalid topics
+  description: >
+    Publish(), Subscribe(), Queue(), and SubscribeFrom() never have their checkTopic
+    error paths tested via the public API. White-box tests exist for checkTopic itself
+    but not through the public entry points.
+  status: pending
+
+- id: 23
+  name: Test Queue() with empty key
+  description: >
+    The "key is empty" error path in Queue() at mq.go:658-659 is never exercised.
+    Add a test calling Queue with an empty key string.
+  status: pending
+
+- id: 24
+  name: Test Request() context cancellation
+  description: >
+    The ctx.Done() branch in Request() at mq.go:763 is never tested. Only the success
+    path is exercised. Add a test with a context that cancels before a reply arrives.
+  status: pending
+
+- id: 25
+  name: Test Reply() with nil mq
+  description: >
+    The "message does not support reply" error at mq.go:359 is never triggered. Add a
+    test calling Reply() on a Msg that was not created through Request().
+  status: pending
+
+- id: 26
+  name: Test Close() return value
+  description: >
+    No test ever checks the return value of Close(). All tests use defer mq.Close()
+    without capturing the error. Add tests that verify Close() returns nil on success.
+  status: pending
+
+- id: 27
+  name: Test concurrent Subscribe and Unsubscribe
+  description: >
+    No test exercises concurrent Subscribe + Unsubscribe, concurrent Stream() creation,
+    concurrent Close() calls, or concurrent Queue() calls creating the same group. These
+    are the code paths most likely to hit the data races identified in items 3 and 4.
+  status: pending
+
+- id: 28
+  name: Fix failing escaped topic tests
+  description: >
+    TestEscapedTopicPubSub and TestEscapedTopicPubSubFrom are currently failing due to
+    non-deterministic message ordering assumptions when escaped and unescaped topics
+    normalize to the same value.
+  status: done
+
+- id: 29
+  name: Remove or implement Msg.Ack()
+  description: >
+    Msg.Ack() at mq.go:368-370 is a no-op stub that returns nil. It is never called
+    and never tested. Either remove it to avoid misleading users, or implement per-message
+    acknowledgment.
+  status: pending
+
+- id: 30
+  name: Default vacuum or unbounded growth warning
+  description: >
+    Without explicit WithVacuum() configuration, messages accumulate in SQLite forever
+    and the database grows without bound. Consider adding a default vacuum strategy,
+    logging a warning at startup when no vacuum is configured, or documenting this
+    prominently.
+  status: pending

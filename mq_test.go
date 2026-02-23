@@ -655,6 +655,55 @@ func TestUnsubscribe(t *testing.T) {
 	}
 }
 
+// TestDoubleUnsubscribePanic verifies that calling Unsubscribe() twice on a
+// Subscribe or Request subscription does not panic (close of closed channel).
+func TestDoubleUnsubscribePanic(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	t.Run("Subscribe double unsubscribe", func(t *testing.T) {
+		sub, err := mq.Subscribe("a.b.c")
+		assert.NoError(t, err)
+
+		assert.NotPanics(t, func() {
+			sub.Unsubscribe()
+			sub.Unsubscribe() // second call must not panic
+		})
+	})
+
+	t.Run("Request double unsubscribe", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Set up a responder so Request can complete cleanly.
+		responder, err := mq.Subscribe("req.topic")
+		assert.NoError(t, err)
+		defer responder.Unsubscribe()
+		go func() {
+			m, ok := <-responder.Chan()
+			if !ok {
+				return
+			}
+			_, _ = m.Reply([]byte("pong"))
+		}()
+
+		sub, err := mq.Request(ctx, "req.topic", []byte("ping"))
+		assert.NoError(t, err)
+
+		// Drain the reply so the internal goroutine can call s.Unsubscribe().
+		select {
+		case <-sub.Chan():
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for reply")
+		}
+
+		assert.NotPanics(t, func() {
+			sub.Unsubscribe()
+			sub.Unsubscribe() // second call must not panic
+		})
+	})
+}
+
 func TestPublishAsync(t *testing.T) {
 	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
 	assert.NoError(t, err)
