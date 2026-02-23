@@ -21,7 +21,7 @@ func globMatcher(topic, glob string) (bool, error) {
 			return false, nil
 		}
 	}
-	return true, nil
+	return len(globParts) == len(topicParts), nil
 }
 
 type globbable interface {

@@ -61,6 +61,55 @@ func (g glob) Id() string {
 //	fmt.Println("match", "a.x.c", trie.Match("a.x.c"))     // [{2.5 a.*.c} {6 a.**}]
 //}
 
+func TestGlobMatcher_LengthMismatch(t *testing.T) {
+	// globMatcher is the SQL function registered as match_glob, used by SubscribeFrom
+	// to filter historical messages. It should only match when the topic and glob have
+	// the same structure (same number of segments), unless wildcards allow it.
+
+	tests := []struct {
+		name     string
+		topic    string
+		glob     string
+		expected bool
+	}{
+		// Exact matches -- should match
+		{name: "exact match single", topic: "a", glob: "a", expected: true},
+		{name: "exact match multi", topic: "a.b.c", glob: "a.b.c", expected: true},
+
+		// Wildcard matches -- should match
+		{name: "single wildcard", topic: "a.b.c", glob: "a.*.c", expected: true},
+		{name: "double wildcard", topic: "a.b.c.d.e", glob: "a.**", expected: true},
+
+		// Mismatch values -- should not match
+		{name: "different value", topic: "a.b.c", glob: "a.x.c", expected: false},
+
+		// BUG: glob shorter than topic -- should NOT match, but globMatcher returns true.
+		// A subscriber to "a.b" should not receive messages published to "a.b.c".
+		{name: "glob shorter than topic", topic: "a.b.c", glob: "a.b", expected: false},
+		{name: "glob shorter than topic 2", topic: "a.b.c.d", glob: "a.b", expected: false},
+
+		// BUG: topic shorter than glob -- should NOT match, but globMatcher returns true.
+		// A message published to "a" should not match a subscriber on "a.b".
+		{name: "topic shorter than glob", topic: "a", glob: "a.b", expected: false},
+		{name: "topic shorter than glob 2", topic: "a.b", glob: "a.b.c.d", expected: false},
+
+		// Wildcard with length mismatch -- ** should still match longer topics
+		{name: "double wildcard matches deeper", topic: "a.b.c.d.e", glob: "a.b.**", expected: true},
+
+		// Single wildcard should NOT match across depth levels
+		{name: "single wildcard same depth", topic: "a.x", glob: "a.*", expected: true},
+		{name: "single wildcard diff depth", topic: "a.x.c", glob: "a.*", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := globMatcher(tt.topic, tt.glob)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, got, "globMatcher(%q, %q) = %v, want %v", tt.topic, tt.glob, got, tt.expected)
+		})
+	}
+}
+
 func TestGlobTopic_Insert(t *testing.T) {
 	trie := newGlobber[glob]()
 	trie.Insert(glob{id: "1", pattern: "a.b.c.d"})
