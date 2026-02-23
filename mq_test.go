@@ -796,6 +796,10 @@ func TestStrangeTopicPubSub(t *testing.T) {
 }
 
 func TestEscapedTopicPubSub(t *testing.T) {
+	// a.{topic} and a.topic both normalise to a.topic, so both subscribers
+	// receive both messages. Delivery order between two messages on the same
+	// topic is non-deterministic, so we assert the set of payloads rather
+	// than their order.
 
 	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
 	assert.NoError(t, err)
@@ -805,48 +809,41 @@ func TestEscapedTopicPubSub(t *testing.T) {
 	done := sync.WaitGroup{}
 	start.Add(2)
 	done.Add(2)
+
+	collect := func(sub *delta.Subscription, label string) {
+		defer done.Done()
+		var got []string
+		for range 2 {
+			m := <-sub.Chan()
+			t.Log("got message", string(m.Payload), "from", label, "at", m.Topic)
+			got = append(got, string(m.Payload))
+		}
+		assert.ElementsMatch(t, []string{"hello1", "hello2"}, got, "subscriber %s", label)
+	}
+
 	go func() {
 		sub, err := mq.Subscribe("a.{topic}")
 		assert.NoError(t, err)
 		start.Done()
-
-		m := <-sub.Chan()
-		t.Log("got message", string(m.Payload), "from 1", "at", m.Topic)
-		assert.Equal(t, "hello1", string(m.Payload))
-
-		m = <-sub.Chan()
-		t.Log("got message", string(m.Payload), "from 1", "at", m.Topic)
-		assert.Equal(t, "hello2", string(m.Payload))
-
-		done.Done()
+		collect(sub, "a.{topic}")
 	}()
 
 	go func() {
 		sub, err := mq.Subscribe("a.topic")
 		assert.NoError(t, err)
 		start.Done()
-
-		m := <-sub.Chan()
-		t.Log("got message", string(m.Payload), "from 2", "at", m.Topic)
-		assert.Equal(t, "hello1", string(m.Payload))
-
-		m = <-sub.Chan()
-		t.Log("got message", string(m.Payload), "from 2", "at", m.Topic)
-		assert.Equal(t, "hello2", string(m.Payload))
-
-		done.Done()
+		collect(sub, "a.topic")
 	}()
-	//
+
 	start.Wait()
-	t.Log("publishing", "hello1", "to a.{topic}")
+	t.Log("publishing hello1 to a.{topic}")
 	_, err = mq.Publish("a.{topic}", []byte("hello1"))
 	assert.NoError(t, err)
 
-	t.Log("publishing", "hello2", "to a.topic")
+	t.Log("publishing hello2 to a.topic")
 	_, err = mq.Publish("a.topic", []byte("hello2"))
 	assert.NoError(t, err)
 	done.Wait()
-
 }
 
 func TestEscapedTopicPubSubFrom(t *testing.T) {
@@ -865,6 +862,10 @@ func TestEscapedTopicPubSubFrom(t *testing.T) {
 	_, err = mq.Publish("a.topic", []byte("unescaped-pre"))
 	assert.NoError(t, err)
 
+	// Both topics normalise to the same stored topic. Historical messages are
+	// returned by the DB in created_at order, so pre-messages are stable.
+	// Live messages ("escaped-post", "unescaped-post") share the same
+	// normalised topic and their delivery order is non-deterministic.
 	wgstart := sync.WaitGroup{}
 	wgdone := sync.WaitGroup{}
 	for i, tt := range []string{"a.{topic}", "a.topic"} {
@@ -878,6 +879,7 @@ func TestEscapedTopicPubSubFrom(t *testing.T) {
 			assert.NoError(t, err)
 			wgstart.Done()
 
+			// Historical messages arrive in DB order (created_at ASC).
 			m := <-sub.Chan()
 			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
 			assert.Equal(t, "escaped-pre", string(m.Payload))
@@ -886,13 +888,13 @@ func TestEscapedTopicPubSubFrom(t *testing.T) {
 			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
 			assert.Equal(t, "unescaped-pre", string(m.Payload))
 
-			m = <-sub.Chan()
-			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
-			assert.Equal(t, "escaped-post", string(m.Payload))
-
-			m = <-sub.Chan()
-			t.Log("goroutine", i, "sub", topic, "got message", string(m.Payload), "at", m.Topic)
-			assert.Equal(t, "unescaped-post", string(m.Payload))
+			// Live messages share the same normalised topic; collect both and
+			// assert the set rather than the order.
+			live := receiveN(sub, 2)
+			for _, p := range live {
+				t.Log("goroutine", i, "sub", topic, "got message", p, "at", m.Topic)
+			}
+			assert.ElementsMatch(t, []string{"escaped-post", "unescaped-post"}, live)
 
 		}(i, tt)
 	}
@@ -908,6 +910,15 @@ func TestEscapedTopicPubSubFrom(t *testing.T) {
 	assert.NoError(t, err)
 
 	wgdone.Wait()
+}
+
+// receiveN drains n messages from sub.Chan() and returns their payloads.
+func receiveN(sub *delta.Subscription, n int) []string {
+	out := make([]string, 0, n)
+	for range n {
+		out = append(out, string((<-sub.Chan()).Payload))
+	}
+	return out
 }
 
 func TestWithVacuum(t *testing.T) {
