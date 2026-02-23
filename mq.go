@@ -88,7 +88,7 @@ type base_ struct {
 	closed        chan struct{}
 	removeOnClose bool
 	log           *slog.Logger
-	streamMu      sync.Mutex
+	streamMu      sync.RWMutex
 	streams       map[string]*MQ
 
 	vacuumInterval time.Duration
@@ -150,7 +150,7 @@ func New(uri string, op ...Op) (*MQ, error) {
 			closeOnce:     sync.Once{},
 			closed:        make(chan struct{}),
 			removeOnClose: false,
-			streamMu:      sync.Mutex{},
+			streamMu:      sync.RWMutex{},
 			streams:       make(map[string]*MQ),
 		},
 		stream: stream_{
@@ -213,7 +213,7 @@ func (c *MQ) tbl() string {
 
 func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
 	c.base.streamMu.Lock()
-	defer c.base.streamMu.Unlock()
+	defer c.base.streamMu.Unlock() // write lock: mutates base.streams
 
 	stream, err := checkStreamName(stream)
 	if err != nil {
@@ -292,7 +292,14 @@ func (c *MQ) Close() error {
 		close(c.base.closed)
 	})
 
+	c.base.streamMu.RLock()
+	streams := make([]*MQ, 0, len(c.base.streams))
 	for _, cc := range c.base.streams {
+		streams = append(streams, cc)
+	}
+	c.base.streamMu.RUnlock()
+
+	for _, cc := range streams {
 		err := ackWritten(cc.base.db, atomic.LoadUint64(&cc.stream.written), cc.tbl)
 		if err != nil {
 			return fmt.Errorf("could not ack written, %w", err)
@@ -425,8 +432,14 @@ func (mq *MQ) vacuumloop() {
 				return
 			case <-time.After(sleep):
 				vacuum(mq)
-				for _, stream := range mq.base.streams {
-					vacuum(stream)
+				mq.base.streamMu.RLock()
+				streams := make([]*MQ, 0, len(mq.base.streams))
+				for _, s := range mq.base.streams {
+					streams = append(streams, s)
+				}
+				mq.base.streamMu.RUnlock()
+				for _, s := range streams {
+					vacuum(s)
 				}
 			}
 		}

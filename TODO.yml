@@ -20,7 +20,7 @@
     Close() at mq.go:295 and vacuumloop() at mq.go:428 iterate base.streams without
     holding streamMu. Concurrent Stream() calls can mutate the map, causing a data race.
     Lock streamMu (read lock) before iterating.
-  status: pending
+  status: done
 
 - id: 4
   name: Double-unsubscribe panic

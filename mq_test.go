@@ -963,6 +963,57 @@ func TestWithVacuum(t *testing.T) {
 
 }
 
+// TestStreamMapRace verifies that concurrent Stream() calls do not race with
+// Close() or the vacuum loop when they iterate base.streams.
+// Run with: go test -race -run TestStreamMapRace
+func TestStreamMapRace(t *testing.T) {
+	t.Run("Stream vs Close", func(t *testing.T) {
+		mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+		assert.NoError(t, err)
+
+		var wg sync.WaitGroup
+		// Hammer Stream() from multiple goroutines while Close() is called.
+		for i := range 20 {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				name := fmt.Sprintf("stream%d", i%5) // reuse a few names to hit the "already exists" path too
+				_, _ = mq.Stream(name)
+			}(i)
+		}
+
+		// Close() races with the goroutines iterating base.streams.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = mq.Close()
+		}()
+
+		wg.Wait()
+	})
+
+	t.Run("Stream vs vacuumloop", func(t *testing.T) {
+		mq, err := delta.New(
+			delta.URITemp(),
+			delta.DBRemoveOnClose(),
+			delta.WithVacuum(delta.VacuumKeepN(100), 10*time.Millisecond),
+		)
+		assert.NoError(t, err)
+		defer mq.Close()
+
+		// Create streams concurrently while the vacuum loop ticks.
+		var wg sync.WaitGroup
+		for i := range 30 {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, _ = mq.Stream(fmt.Sprintf("vacstream%d", i))
+			}(i)
+		}
+		wg.Wait()
+	})
+}
+
 func TestWithVacuumLoop(t *testing.T) {
 
 	mq, err := delta.New(delta.URITemp(),
