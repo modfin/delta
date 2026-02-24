@@ -1163,6 +1163,34 @@ func TestNew_ErrorPath_DBConnectionLeak(t *testing.T) {
 // TestClose_DBLeakOnError verifies that Close() always closes the underlying
 // database connection even when ackWritten() or metrics() fails mid-loop.
 //
+// TestRemoveStore_NoWALSHM is a regression test for issue 14: RemoveStore returns an
+// error when WAL or SHM files are absent. After a clean shutdown SQLite removes the
+// WAL and SHM files, so RemoveStore must treat "file not found" as success for those
+// two ancillary files.
+func TestRemoveStore_NoWALSHM(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := dir + "/test.db"
+	uri := delta.URIFromPath(dbPath)
+
+	mq, err := delta.New(uri)
+	assert.NoError(t, err)
+	_, err = mq.Publish("test.topic", []byte("hello"))
+	assert.NoError(t, err)
+	assert.NoError(t, mq.Close())
+
+	// Simulate a clean SQLite shutdown: remove WAL and SHM files if they exist.
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
+
+	// RemoveStore must NOT return an error just because WAL/SHM are absent.
+	err = delta.RemoveStore(uri, nil)
+	assert.NoError(t, err, "RemoveStore should succeed when WAL/SHM files do not exist")
+
+	// The main DB file must also be gone.
+	_, statErr := os.Stat(dbPath)
+	assert.True(t, os.IsNotExist(statErr), "main DB file should have been removed")
+}
+
 // This is a regression test for issue 6: DB connection leak in Close() error paths.
 // Before the fix, Close() returns early on ackWritten/metrics errors without calling
 // db.Close(), leaking one or more file descriptors per call. Running 10 iterations

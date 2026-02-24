@@ -348,10 +348,18 @@ func RemoveStore(uri string, logger *slog.Logger) error {
 
 	logger.Info("[delta] remove store", "db", file, "shm", fmt.Sprintf("%s-shm", file), "wal", fmt.Sprintf("%s-wal", file))
 
+	removeIgnoreNotExist := func(path string) error {
+		err := os.Remove(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
 	err := errors.Join(
 		os.Remove(file),
-		os.Remove(fmt.Sprintf("%s-shm", file)),
-		os.Remove(fmt.Sprintf("%s-wal", file)),
+		removeIgnoreNotExist(fmt.Sprintf("%s-shm", file)),
+		removeIgnoreNotExist(fmt.Sprintf("%s-wal", file)),
 	)
 	if strings.Contains(query, "tmp=true") {
 		logger.Info("[delta] remove store dir", "dir", filepath.Dir(file))

@@ -109,7 +109,7 @@
     In mq.go:327-331, errors.Join combines errors from removing the main file, SHM, and
     WAL files. If WAL or SHM files don't exist (common after clean shutdown), the function
     returns an error. Use os.IsNotExist to filter expected absences.
-  status: pending
+  status: done
 
 - id: 15
   name: Dead assignment m.At = last in SubscribeFrom
