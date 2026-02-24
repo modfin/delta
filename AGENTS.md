@@ -4,6 +4,127 @@
 
 Go library (`github.com/modfin/delta`) -- an SQLite-backed message queue providing Pub/Sub, Queue (load-balanced), Request/Reply, multiple streams, and glob-based topic matching. Single flat package `delta` with no subdirectories for source code. Requires CGo (C compiler) due to `github.com/mattn/go-sqlite3`.
 
+## Public API Reference
+
+This section documents all exported symbols that constitute the public API.
+
+### Core Types
+
+| Type | File | Description |
+|------|------|-------------|
+| `MQ` | mq.go:115 | Main message queue instance with Pub/Sub, Queue, Request/Reply functionality |
+| `Msg` | mq.go:404 | Represents a message with ID, topic, payload, and timestamp |
+| `Publication` | mq.go:638 | Result of Publish/PublishAsync operations with embedded Msg |
+| `Subscription` | mq.go:684 | Active subscription to a topic pattern |
+| `Op` | mq.go:22 | Functional option type for configuring MQ during construction |
+| `VacuumFunc` | mq.go:82 | Function signature for message cleanup strategies |
+
+### Constructor
+
+| Function | File | Signature | Description |
+|----------|------|-----------|-------------|
+| `New` | mq.go:155 | `New(uri string, op ...Op) (*MQ, error)` | Creates a new MQ instance with SQLite URI and options |
+
+### Configuration Options (Op)
+
+| Function | File | Signature | Description |
+|----------|------|-----------|-------------|
+| `DBSyncOff` | mq.go:37 | `DBSyncOff() Op` | Sets SQLite synchronous=off for write performance |
+| `DBRemoveOnClose` | mq.go:44 | `DBRemoveOnClose() Op` | Removes database files when MQ is closed |
+| `WithLogger` | mq.go:52 | `WithLogger(log *slog.Logger) Op` | Sets a custom structured logger |
+| `WithVacuum` | mq.go:63 | `WithVacuum(vacuum VacuumFunc, interval time.Duration) Op` | Configures automatic message cleanup |
+
+### Database URI Helpers
+
+| Function | File | Signature | Description |
+|----------|------|-----------|-------------|
+| `URITemp` | util.go:22 | `URITemp() string` | Creates a temporary database URI in system temp directory |
+| `URIFromPath` | util.go:31 | `URIFromPath(path string) (string, error)` | Creates file URI from filesystem path |
+| `RemoveStore` | mq.go:357 | `RemoveStore(uri string, logger *slog.Logger) error` | Removes database files (including -shm, -wal) |
+
+### Vacuum Strategies
+
+| Function | File | Signature | Description |
+|----------|------|-----------|-------------|
+| `VacuumOnAge` | util.go:181 | `VacuumOnAge(maxAge time.Duration) VacuumFunc` | Removes messages older than specified duration |
+| `VacuumKeepN` | util.go:203 | `VacuumKeepN(n int) VacuumFunc` | Keeps only N most recent messages |
+| `VacuumOnReadAck` | util.go:220 | `VacuumOnReadAck(mq *MQ)` | Removes acknowledged messages (must call `Msg.Ack()`) |
+
+### MQ Methods
+
+#### Lifecycle
+
+| Method | File | Signature | Description |
+|--------|------|-----------|-------------|
+| `Close` | mq.go:315 | `(c *MQ) Close() error` | Closes the MQ and all its streams |
+| `CurrentStream` | mq.go:1016 | `(c *MQ) CurrentStream() string` | Returns the current stream name |
+
+#### Stream Management
+
+| Method | File | Signature | Description |
+|--------|------|-----------|-------------|
+| `Stream` | mq.go:243 | `(c *MQ) Stream(stream string, ops ...Op) (*MQ, error)` | Creates or returns an existing named stream |
+
+#### Publishing
+
+| Method | File | Signature | Description |
+|--------|------|-----------|-------------|
+| `Publish` | mq.go:648 | `(mq *MQ) Publish(topic string, payload []byte) (*Publication, error)` | Synchronously publishes a message |
+| `PublishAsync` | mq.go:670 | `(mq *MQ) PublishAsync(topic string, payload []byte) *Publication` | Asynchronously publishes a message |
+
+#### Subscribing
+
+| Method | File | Signature | Description |
+|--------|------|-----------|-------------|
+| `Subscribe` | mq.go:756 | `(mq *MQ) Subscribe(topic string) (*Subscription, error)` | Creates a Pub/Sub subscription |
+| `SubscribeFrom` | mq.go:950 | `(mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error)` | Subscribes with historical replay |
+| `Queue` | mq.go:789 | `(mq *MQ) Queue(topic string, key string) (*Subscription, error)` | Creates a load-balanced queue subscription |
+| `Request` | mq.go:887 | `(mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subscription, error)` | Publishes request and subscribes to reply |
+
+### Msg Methods
+
+| Method | File | Signature | Description |
+|--------|------|-----------|-------------|
+| `Reply` | mq.go:412 | `(m *Msg) Reply(payload []byte) (Msg, error)` | Replies to a message (publishes to `_inbox.{MessageId}`) |
+| `Ack` | mq.go:427 | `(m *Msg) Ack() error` | Acknowledges the message for `VacuumOnReadAck` |
+
+### Publication Methods
+
+| Method | File | Signature | Description |
+|--------|------|-----------|-------------|
+| `Done` | mq.go:644 | `(p *Publication) Done() <-chan struct{}` | Returns channel that closes when publish completes |
+
+### Subscription Methods
+
+| Method | File | Signature | Description |
+|--------|------|-----------|-------------|
+| `Topic` | mq.go:711 | `(s *Subscription) Topic() string` | Returns the subscription's topic pattern |
+| `Id` | mq.go:714 | `(s *Subscription) Id() string` | Returns the unique subscription ID |
+| `Chan` | mq.go:747 | `(s *Subscription) Chan() <-chan Msg` | Returns the message channel |
+| `Next` | mq.go:751 | `(s *Subscription) Next() (Msg, bool)` | Blocks until next message |
+
+**Subscription Fields:**
+
+| Field | File | Type | Description |
+|-------|------|------|-------------|
+| `Unsubscribe` | mq.go:695 | `func()` | Call to close the subscription |
+
+### Exported Constants
+
+| Constant | File | Type | Value | Description |
+|----------|------|------|-------|-------------|
+| `DEFAULT_STREAM` | util.go:20 | `string` | `"default"` | Default stream name |
+| `OptimizeLatency` | util.go:16 | `int` | `0` | Optimization mode for low latency |
+| `OptimizeThroughput` | util.go:17 | `int` | `1` | Optimization mode for high throughput |
+
+### Summary
+
+**Total Public API Surface:**
+- 6 Types: `MQ`, `Msg`, `Publication`, `Subscription`, `Op`, `VacuumFunc`
+- 12 Functions: `New`, `URITemp`, `URIFromPath`, `RemoveStore`, `DBSyncOff`, `DBRemoveOnClose`, `WithLogger`, `WithVacuum`, `VacuumOnAge`, `VacuumKeepN`, `VacuumOnReadAck`
+- 17 Methods: 10 on MQ, 2 on Msg, 1 on Publication, 4 on Subscription
+- 3 Constants: `DEFAULT_STREAM`, `OptimizeLatency`, `OptimizeThroughput`
+
 ## Build / Test / Lint Commands
 
 ```sh
@@ -50,7 +171,7 @@ delta/
   glob_test.go         -- Unit tests for glob trie (package delta, white-box)
   util_test.go         -- Unit tests for util functions (package delta, white-box)
   x_benchmark_test.go  -- Benchmarks (package delta_test, black-box)
-  examples/            -- Standalone example programs (simple, queue, request-reply, sub-from)
+  _examples/            -- Standalone example programs (simple, queue, request-reply, sub-from)
 ```
 
 ## Dependencies
