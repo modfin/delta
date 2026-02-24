@@ -1171,7 +1171,8 @@ func TestNew_ErrorPath_DBConnectionLeak(t *testing.T) {
 func TestRemoveStore_NoWALSHM(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := dir + "/test.db"
-	uri := delta.URIFromPath(dbPath)
+	uri, err := delta.URIFromPath(dbPath)
+	assert.NoError(t, err)
 
 	mq, err := delta.New(uri)
 	assert.NoError(t, err)
@@ -1254,7 +1255,8 @@ func TestClose_DBLeakOnError(t *testing.T) {
 		// Use a file-backed DB so SQLite holds real OS file descriptors.
 		dir := t.TempDir()
 		dbPath := dir + "/test.db"
-		uri := delta.URIFromPath(dbPath)
+		uri, err := delta.URIFromPath(dbPath)
+		assert.NoError(t, err, "iteration %d: URIFromPath() failed", i)
 
 		mq, err := delta.New(uri)
 		assert.NoError(t, err, "iteration %d: New() failed", i)

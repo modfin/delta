@@ -154,7 +154,8 @@ func TestURIFromPath_ValidPath(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/mydb.db"
 
-	uri := delta.URIFromPath(path)
+	uri, err := delta.URIFromPath(path)
+	assert.NoError(t, err)
 	assert.True(t, len(uri) > 0, "URI must not be empty")
 	assert.Contains(t, uri, "file:")
 	assert.Contains(t, uri, path)
@@ -176,11 +177,12 @@ func TestURIFromPath_PathWithSpaces(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/my db with spaces/mydb.db"
 
-	uri := delta.URIFromPath(path)
+	uri, err := delta.URIFromPath(path)
+	assert.NoError(t, err)
 	assert.Contains(t, uri, "file:")
 
 	// Directory should have been created by URIFromPath.
-	_, err := os.Stat(dir + "/my db with spaces")
+	_, err = os.Stat(dir + "/my db with spaces")
 	assert.NoError(t, err, "URIFromPath should create parent directories")
 
 	mq, err := delta.New(uri)
@@ -197,7 +199,7 @@ func TestURIFromPath_CreatesParentDirectories(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/a/b/c/mydb.db"
 
-	_ = delta.URIFromPath(path)
+	_, _ = delta.URIFromPath(path)
 
 	_, err := os.Stat(dir + "/a/b/c")
 	assert.NoError(t, err, "URIFromPath must create nested parent directories")

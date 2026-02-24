@@ -93,7 +93,7 @@
   description: >
     URITemp() in util.go:25 creates directories with 0755 permissions. Should use 0700
     to prevent other system users from reading directory listings.
-  status: pending
+  status: done
 
 - id: 13
   name: MkdirAll errors silently discarded
@@ -101,7 +101,7 @@
     URITemp() at util.go:25 and URIFromPath() at util.go:30 discard os.MkdirAll errors.
     If directory creation fails, the subsequent db open fails with a confusing error.
     Propagate the error.
-  status: pending
+  status: done
 
 - id: 14
   name: RemoveStore errors on missing WAL/SHM files
