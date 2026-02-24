@@ -1,39 +1,9 @@
 package delta
 
 import (
-	"encoding/base32"
-	"encoding/binary"
 	"fmt"
-	"math/rand"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync/atomic"
-	"time"
 )
-
-const (
-	OptimizeLatency = iota
-	OptimizeThroughput
-)
-
-const DEFAULT_STREAM = "default"
-
-func URITemp() string {
-	d := fmt.Sprintf("%d-delta", time.Now().UnixNano())
-	uri := filepath.Join(os.TempDir(), d, "delta.db")
-	if err := os.MkdirAll(filepath.Dir(uri), 0700); err != nil {
-		panic(fmt.Sprintf("delta: URITemp could not create temp directory: %v", err))
-	}
-	return fmt.Sprintf("file:%s?tmp=true", uri)
-}
-
-func URIFromPath(path string) (string, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return "", fmt.Errorf("could not create directory for db path, %w", err)
-	}
-	return fmt.Sprintf("file:%s", path), nil
-}
 
 func checkStreamName(stream string) (string, error) {
 	stream = strings.TrimSpace(stream)
@@ -153,82 +123,4 @@ func checkTopic(topic string) (string, error) {
 		}
 	}
 	return strings.Join(parts, "."), nil
-}
-
-var uid_count uint32
-
-func uid() string {
-
-	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
-	t := time.Now().UnixNano()
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, uint64(t))
-	ts := enc.EncodeToString(b)
-
-	countInt := atomic.AddUint32(&uid_count, 1)
-	b = make([]byte, 4)
-	binary.BigEndian.PutUint32(b, countInt)
-	count := enc.EncodeToString(b)
-
-	randInt := rand.Uint64()
-	b = make([]byte, 4)
-	binary.BigEndian.PutUint32(b, uint32(randInt))
-	rand := enc.EncodeToString(b)
-
-	return strings.ToLower(fmt.Sprintf("%s-%s-%s", ts, count, rand))
-}
-
-func VacuumOnAge(maxAge time.Duration) VacuumFunc {
-	if maxAge < 0 {
-		maxAge = -maxAge
-	}
-	return func(mq *MQ) {
-		removeBefore := time.Now().Add(-maxAge)
-
-		l := mq.base.log.With("type", "max-age")
-
-		l.Info("[delta] vacuuming", "older_then", removeBefore, "in", mq.CurrentStream())
-
-		removed, err := vacuumBefore(mq.base.db, removeBefore, mq.tbl)
-		if err != nil {
-			l.Error("[delta] vacuuming error", "err", err)
-		}
-		if removed > 0 {
-			l.Info("[delta] vacuuming result", "removed", removed, "in", mq.CurrentStream())
-		}
-
-	}
-}
-
-func VacuumKeepN(n int) VacuumFunc {
-	return func(mq *MQ) {
-		l := mq.base.log.With("type", "keep-n")
-		l.Info("[delta] vacuuming", "top", n, "in", mq.CurrentStream())
-
-		removed, err := vacuumKeep(mq.base.db, n, mq.tbl)
-		if err != nil {
-			l.Error("[delta] vacuuming error", "err", err)
-			return
-		}
-		if removed > 0 {
-			l.Info("[delta] vacuuming result", "removed", removed, "in", mq.CurrentStream())
-		}
-
-	}
-}
-
-func VacuumOnReadAck(mq *MQ) {
-	l := mq.base.log.With("type", "read-ack")
-
-	l.Info("[delta] vacuuming", "stream", mq.CurrentStream())
-
-	removed, err := vacuumReadAck(mq.base.db, mq.tbl)
-	if err != nil {
-		l.Error("[delta] vacuuming error", "err", err)
-		return
-	}
-	if removed > 0 {
-		l.Info("[delta] vacuuming result", "removed", removed, "in", mq.CurrentStream())
-	}
-
 }
