@@ -471,7 +471,7 @@ func (mq *MQ) write(m Msg) (Msg, error) {
 func (mq *MQ) vacuumloop() {
 	go func() {
 		if mq.base.vacuum == nil {
-			mq.base.log.Info("[delta] vacuuming disabled")
+			mq.base.log.Warn("[delta] no vacuum strategy configured; messages will accumulate in the database without bound")
 			return
 		}
 		if mq.base.vacuumInterval < 100*time.Millisecond {

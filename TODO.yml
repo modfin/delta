@@ -148,4 +148,4 @@
     and the database grows without bound. Consider adding a default vacuum strategy,
     logging a warning at startup when no vacuum is configured, or documenting this
     prominently.
-  status: pending
+  status: done

@@ -1431,3 +1431,76 @@ func TestRequest_ContextCancellation_Deterministic(t *testing.T) {
 			"internal goroutine is probably blocked in s.notify() with no reader on s.Chan()",
 		leaked, iterations)
 }
+
+// capturingHandler is a slog.Handler that records all log records for inspection in tests.
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *capturingHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(name string) slog.Handler       { return h }
+
+func (h *capturingHandler) hasWarn(substr string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == slog.LevelWarn && strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestNoVacuumWarning is a regression test for issue 30: when New() is called
+// without WithVacuum(), the MQ should emit a slog.Warn-level message at startup
+// to alert the operator that messages will accumulate forever.
+//
+// The fix: in vacuumloop() (or New()), when mq.base.vacuum == nil, log a Warn
+// instead of (or in addition to) the existing Info "[delta] vacuuming disabled".
+func TestNoVacuumWarning(t *testing.T) {
+	handler := &capturingHandler{}
+	logger := slog.New(handler)
+
+	// Create MQ without any vacuum configuration.
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose(), delta.WithLogger(logger))
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	// Give the background goroutine a moment to start and emit its log line.
+	time.Sleep(50 * time.Millisecond)
+
+	assert.True(t, handler.hasWarn("vacuum"),
+		"expected a slog.Warn-level message containing \"vacuum\" when no vacuum strategy is configured, "+
+			"but none was recorded; operators need this warning to avoid unbounded database growth")
+}
+
+// TestNoVacuumWarning_SuppressedWhenConfigured verifies the complementary
+// invariant: when WithVacuum() IS provided, no spurious vacuum warning is logged.
+func TestNoVacuumWarning_SuppressedWhenConfigured(t *testing.T) {
+	handler := &capturingHandler{}
+	logger := slog.New(handler)
+
+	mq, err := delta.New(
+		delta.URITemp(),
+		delta.DBRemoveOnClose(),
+		delta.WithLogger(logger),
+		delta.WithVacuum(delta.VacuumKeepN(1000), time.Hour),
+	)
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	assert.False(t, handler.hasWarn("vacuum"),
+		"expected no slog.Warn about vacuum when a vacuum strategy is configured")
+}
