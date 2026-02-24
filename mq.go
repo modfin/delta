@@ -117,6 +117,28 @@ type MQ struct {
 	stream stream_
 }
 
+// testPanicHookMu guards testPanicHook to satisfy the race detector in tests.
+var testPanicHookMu sync.RWMutex
+
+// testPanicHook is called at the start of each background goroutine iteration
+// during tests. It is nil in production. Set it via setTestPanicHook in internal
+// tests (package delta) to inject a panic and verify that the goroutine's
+// deferred recover() catches it.
+var testPanicHook func()
+
+func setTestPanicHook(h func()) {
+	testPanicHookMu.Lock()
+	testPanicHook = h
+	testPanicHookMu.Unlock()
+}
+
+func getTestPanicHook() func() {
+	testPanicHookMu.RLock()
+	h := testPanicHook
+	testPanicHookMu.RUnlock()
+	return h
+}
+
 func init() {
 	// adding special driver for sqlite3
 	// with support for specific glob match function for topic matching
@@ -453,20 +475,35 @@ func (mq *MQ) vacuumloop() {
 
 		mq.base.log.Info("[delta] starting vacuum loop", "interval", sleep)
 		for {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						mq.base.log.Error("[delta] panic in vacuum loop, recovering", "panic", r)
+					}
+				}()
+				select {
+				case <-mq.base.closed:
+					return
+				case <-time.After(sleep):
+					vacuum(mq)
+					mq.base.streamMu.RLock()
+					streams := make([]*MQ, 0, len(mq.base.streams))
+					for _, s := range mq.base.streams {
+						streams = append(streams, s)
+					}
+					mq.base.streamMu.RUnlock()
+					for _, s := range streams {
+						vacuum(s)
+					}
+				}
+			}()
+
+			// Exit the outer loop only after the MQ is closed. The inner func()
+			// returns both on normal ticks and on panic recovery, so we must check.
 			select {
 			case <-mq.base.closed:
 				return
-			case <-time.After(sleep):
-				vacuum(mq)
-				mq.base.streamMu.RLock()
-				streams := make([]*MQ, 0, len(mq.base.streams))
-				for _, s := range mq.base.streams {
-					streams = append(streams, s)
-				}
-				mq.base.streamMu.RUnlock()
-				for _, s := range streams {
-					vacuum(s)
-				}
+			default:
 			}
 		}
 	}()
@@ -480,65 +517,104 @@ func (mq *MQ) readloop() {
 	producer := func() {
 		var dirty bool
 		for {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						mq.base.log.Error("[delta] panic in read-loop producer, recovering", "panic", r)
+					}
+				}()
 
-			if dirty {
-				dirty = false
-				// TODO ack read is great and all, but for a vacuum, we might end up in a place where we delete a message
-				// prior to it being read by the consumer.
-				err := ackRead(mq.base.db, atomic.LoadUint64(&mq.stream.read), mq.tbl)
-				if err != nil {
-					mq.base.log.Error("[delta] could not ack read", "err", err, "stream_", mq.CurrentStream())
+				if dirty {
+					dirty = false
+					// TODO ack read is great and all, but for a vacuum, we might end up in a place where we delete a message
+					// prior to it being read by the consumer.
+					err := ackRead(mq.base.db, atomic.LoadUint64(&mq.stream.read), mq.tbl)
+					if err != nil {
+						mq.base.log.Error("[delta] could not ack read", "err", err, "stream_", mq.CurrentStream())
+					}
 				}
-			}
 
+				select {
+				case <-mq.base.closed:
+					mq.base.log.Debug("[delta] reader, stopping loop", "stream_", mq.CurrentStream())
+					return
+				case <-mq.stream.inform: // probably faster to remove this and have a tighter sleep
+				case <-time.After(100 * time.Millisecond):
+				}
+
+				for {
+					written := atomic.LoadUint64(&mq.stream.written)
+					read := atomic.LoadUint64(&mq.stream.read)
+
+					// if we have read all messages, need to wait for new messages
+					if read > written {
+						break
+					}
+
+					written = min(written, read+size)
+					for ; read <= written; read++ {
+						jobs <- read
+					}
+					atomic.StoreUint64(&mq.stream.read, read)
+					dirty = true
+				}
+			}()
+
+			// Exit the outer loop once the MQ has been closed.
 			select {
 			case <-mq.base.closed:
-				mq.base.log.Debug("[delta] reader, stopping loop", "stream_", mq.CurrentStream())
 				return
-			case <-mq.stream.inform: // probably faster to remove this and have a tighter sleep
-			case <-time.After(100 * time.Millisecond):
-			}
-
-			for {
-				written := atomic.LoadUint64(&mq.stream.written)
-				read := atomic.LoadUint64(&mq.stream.read)
-
-				// if we have read all messages, need to wait for new messages
-				if read > written {
-					break
-				}
-
-				written = min(written, read+size)
-				for ; read <= written; read++ {
-					jobs <- read
-				}
-				atomic.StoreUint64(&mq.stream.read, read)
-				dirty = true
+			default:
 			}
 		}
 	}
 
 	consumer := func(i int) {
 		for {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						mq.base.log.Error("[delta] panic in read-loop consumer, recovering", "panic", r)
+					}
+				}()
 
-			var messageId uint64
+				if h := getTestPanicHook(); h != nil {
+					h()
+				}
+
+				var messageId uint64
+				select {
+				case <-mq.base.closed:
+					return
+				case messageId = <-jobs:
+				}
+				m, err := message(mq.base.db, messageId, mq.tbl)
+				if err != nil {
+					mq.base.log.Error("[delta] could not get message", "id", messageId, "err", err, "stream_", mq.CurrentStream())
+					return
+				}
+
+				subs := mq.stream.subs.Match(m.Topic)
+				for _, s := range subs {
+					s := s
+					m := m
+					m.mq = mq
+					go func() { // TODO deap copy message? should it not be a go routine? then a pool of go routines?
+						defer func() {
+							if r := recover(); r != nil {
+								mq.base.log.Error("[delta] panic in subscriber notify goroutine, recovering", "panic", r)
+							}
+						}()
+						s.notify(m)
+					}()
+				}
+			}()
+
+			// Exit the outer loop once the MQ has been closed.
 			select {
 			case <-mq.base.closed:
 				return
-			case messageId = <-jobs:
-			}
-			m, err := message(mq.base.db, messageId, mq.tbl)
-			if err != nil {
-				mq.base.log.Error("[delta] could not get message", "id", messageId, "err", err, "stream_", mq.CurrentStream())
-				continue
-			}
-
-			subs := mq.stream.subs.Match(m.Topic)
-			for _, s := range subs {
-				s := s
-				m := m
-				m.mq = mq
-				go s.notify(m) // TODO deap copy message? should it not be a go routine? then a pool of go routines?
+			default:
 			}
 		}
 	}
@@ -733,6 +809,11 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 		}
 
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					mq.base.log.Error("[delta] panic in queue distributor, recovering", "panic", r)
+				}
+			}()
 		outer:
 			for m := range g.main.Chan() {
 				g.mu.Lock()
@@ -753,6 +834,11 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 					}
 				}
 				go func(s *Subscription, m Msg) {
+					defer func() {
+						if r := recover(); r != nil {
+							mq.base.log.Error("[delta] panic in queue notify goroutine, recovering", "panic", r)
+						}
+					}()
 					s.notify(m)
 				}(ss[0], m)
 
@@ -819,6 +905,11 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				mq.base.log.Error("[delta] panic in request goroutine, recovering", "panic", r)
+			}
+		}()
 		defer sub.Unsubscribe()
 		defer s.Unsubscribe()
 
@@ -861,12 +952,23 @@ func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error)
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				mq.base.log.Error("[delta] panic in subscribe-from historical goroutine, recovering", "panic", r)
+			}
+		}()
+
 		mq.stream.subs.Insert(buffer)
 		splitt := atomic.LoadUint64(&mq.stream.written)
 
 		start := sync.WaitGroup{}
 		start.Add(1)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					mq.base.log.Error("[delta] panic in subscribe-from live forwarding goroutine, recovering", "panic", r)
+				}
+			}()
 			start.Wait()
 			for m := range buffer.Chan() {
 				if m.MessageId <= splitt {

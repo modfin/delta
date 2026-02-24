@@ -70,7 +70,7 @@
     The read loop producer/consumers, vacuum loop, queue distributor, and SubscribeFrom
     goroutines have no recover(). A panic in any of them crashes the entire process. Add
     deferred recover() with logging to each background goroutine.
-  status: pending
+  status: done
 
 - id: 10
   name: globMatcher matches too broadly
