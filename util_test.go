@@ -80,8 +80,8 @@ func Test_checkTopicSub(t *testing.T) {
 		{
 			name:    "a.b.c>",
 			args:    args{topic: "a.b.c>"},
-			want:    "a.b.c>",
-			wantErr: assert.NoError,
+			want:    "",
+			wantErr: assert.Error,
 		},
 		{
 			name:    "a.b.c.*",
@@ -142,6 +142,43 @@ func Test_checkTopicSub(t *testing.T) {
 			args:    args{topic: "{a_b.c.d.{e}.f}"},
 			want:    "{a_b.c.d.{e}.f}",
 			wantErr: assert.NoError,
+		},
+		// Issue 1: character allowlist – invalid characters must be rejected.
+		{
+			name:    "null byte",
+			args:    args{topic: "a.b\x00c"},
+			want:    "",
+			wantErr: assert.Error,
+		},
+		{
+			name:    "control char",
+			args:    args{topic: "a.b\x01c"},
+			want:    "",
+			wantErr: assert.Error,
+		},
+		{
+			name:    "single quote",
+			args:    args{topic: "a.b'c"},
+			want:    "",
+			wantErr: assert.Error,
+		},
+		{
+			name:    "semicolon",
+			args:    args{topic: "a.b;c"},
+			want:    "",
+			wantErr: assert.Error,
+		},
+		{
+			name:    "space in middle",
+			args:    args{topic: "a b.c"},
+			want:    "",
+			wantErr: assert.Error,
+		},
+		{
+			name:    "at sign",
+			args:    args{topic: "a.b@c"},
+			want:    "",
+			wantErr: assert.Error,
 		},
 	}
 	for _, tt := range tests {

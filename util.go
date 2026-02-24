@@ -115,6 +115,14 @@ func splitTopic(topic string) []string {
 	return parts
 }
 
+// isAllowedTopicRune reports whether r is permitted in a plain (non-brace-group)
+// topic segment. The allowlist is [a-z0-9_.*] where * is used for glob wildcards.
+func isAllowedTopicRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') ||
+		(r >= '0' && r <= '9') ||
+		r == '_' || r == '.' || r == '*'
+}
+
 func checkTopic(topic string) (string, error) {
 	topic = strings.TrimSpace(topic)
 	topic = strings.Trim(topic, ".")
@@ -122,14 +130,22 @@ func checkTopic(topic string) (string, error) {
 	if len(topic) == 0 {
 		return "", fmt.Errorf("topic is empty")
 	}
-	// TODO check that there are other things then .
-	//return topic, nil
 
 	parts := splitTopic(topic)
 
 	for i := range parts {
 		if strings.Contains(parts[i], ".") {
+			// This part originated from a brace-enclosed group with dots (e.g.
+			// "a.email.with.dots@example.com"). Treat it as an opaque literal key
+			// and skip character validation; just re-wrap it in braces.
 			parts[i] = "{" + parts[i] + "}"
+			continue
+		}
+		// Plain segment: enforce the allowlist [a-z0-9_.*].
+		for _, r := range parts[i] {
+			if !isAllowedTopicRune(r) {
+				return "", fmt.Errorf("topic contains invalid character %q; only [a-z0-9_.*] are allowed in plain segments", r)
+			}
 		}
 	}
 	return strings.Join(parts, "."), nil

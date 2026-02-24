@@ -4,7 +4,7 @@
     checkTopic() in util.go:118-136 only checks for emptiness. Any characters including
     control chars, null bytes, and SQL-special characters are allowed. Add an allowlist
     like [a-zA-Z0-9._*{}] to prevent latent injection risks if future code interpolates topics.
-  status: pending
+  status: done
 
 - id: 2
   name: Deadlock in notify()
