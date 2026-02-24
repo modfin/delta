@@ -246,7 +246,6 @@ func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
 			groups:  map[string]*group{},
 		},
 	}
-	cc.base.streams[stream] = cc
 
 	err = schema(cc)
 	if err != nil {
@@ -268,6 +267,10 @@ func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
 
 	atomic.SwapUint64(&cc.stream.written, written)
 	atomic.SwapUint64(&cc.stream.read, read)
+
+	// Only register the stream after full initialization succeeds, so a failed
+	// Stream() call does not leave a stale, partially-initialized entry in the map.
+	cc.base.streams[stream] = cc
 	cc.readloop()
 
 	return cc, nil

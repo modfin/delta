@@ -1084,6 +1084,49 @@ func countOpenFDs(t *testing.T) int {
 	return len(entries)
 }
 
+// TestStream_StaleStreamOnError verifies that when Stream() fails during
+// initialization (e.g. because an Op returns an error), the partially-initialized
+// stream is NOT left in the internal streams map. A subsequent successful call to
+// Stream() with the same name must return a working stream rather than the stale one.
+func TestStream_StaleStreamOnError(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	failingOp := func(*delta.MQ) error {
+		return errors.New("injected op failure")
+	}
+
+	// First call: should fail because of the injected Op.
+	bad, err := mq.Stream("test_stream", failingOp)
+	assert.Error(t, err, "Stream() with a failing Op should return an error")
+	assert.Nil(t, bad, "Stream() should return nil on error")
+
+	// Second call without the failing Op: must succeed.
+	// Before the fix this returned an error because the stale entry was cached.
+	good, err := mq.Stream("test_stream")
+	assert.NoError(t, err, "Stream() retry without failing Op should succeed")
+	assert.NotNil(t, good, "Stream() retry should return a usable MQ handle")
+
+	if good == nil {
+		return
+	}
+
+	// Verify the returned stream is actually functional.
+	sub, err := good.Subscribe("ping")
+	assert.NoError(t, err)
+
+	_, err = good.Publish("ping", []byte("pong"))
+	assert.NoError(t, err)
+
+	select {
+	case msg := <-sub.Chan():
+		assert.Equal(t, "pong", string(msg.Payload))
+	case <-time.After(3 * time.Second):
+		assert.Fail(t, "timeout waiting for message on recovered stream")
+	}
+}
+
 // TestNew_ErrorPath_DBConnectionLeak verifies that when New() fails after
 // sql.Open succeeds (e.g. because an Op returns an error), the database
 // connection is closed and no file descriptor is leaked.

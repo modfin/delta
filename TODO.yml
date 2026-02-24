@@ -54,7 +54,7 @@
     In Stream() at mq.go:243-256, a partially-initialized stream is added to the streams
     map before schema/ops are applied. On failure, it remains in the map. Move the map
     insertion to after successful initialization.
-  status: pending
+  status: done
 
 - id: 8
   name: Goroutine leak in Request() on context cancellation
