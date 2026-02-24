@@ -12,7 +12,7 @@
     mq.go:596-598 has a blocking send on notifyChan while holding notifyMu.RLock(), which
     prevents close() from acquiring the write lock. The author is aware (TODO comment).
     Consider using a buffered channel or select with a default/timeout.
-  status: pending
+  status: done
 
 - id: 3
   name: Data race in Close() and vacuumloop()

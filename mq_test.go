@@ -1191,6 +1191,56 @@ func TestRemoveStore_NoWALSHM(t *testing.T) {
 	assert.True(t, os.IsNotExist(statErr), "main DB file should have been removed")
 }
 
+// TestNotifyDeadlock is a regression test for issue 2: Deadlock in notify().
+//
+// SubscribeFrom registers an internal "buffer" subscription. When a message
+// arrives the read-loop calls buffer.notify(), which holds notifyMu.RLock()
+// while sending on buffer.notifyChan. The forwarding goroutine reads from that
+// channel and calls s.notify() on the outer subscription. If nobody reads from
+// s.Chan(), the forwarding goroutine blocks, and the next buffer.notify() call
+// also blocks (channel full). A concurrent Unsubscribe() call then invokes
+// buffer.close(), which tries to acquire notifyMu.Lock() – deadlocking because
+// notify() still holds the read lock.
+//
+// The test expects Unsubscribe() to return within 2 seconds.
+func TestNotifyDeadlock(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	// SubscribeFrom uses an internal buffer subscription whose close() method
+	// acquires the write lock -- the deadlock path.
+	sub, err := mq.SubscribeFrom("deadlock.test", time.Time{})
+	assert.NoError(t, err)
+
+	// Publish two messages. The first blocks the forwarding goroutine (nobody
+	// reads s.Chan()), and the second causes the read-loop to call
+	// buffer.notify() while it holds notifyMu.RLock() and blocks.
+	_, err = mq.Publish("deadlock.test", []byte("msg1"))
+	assert.NoError(t, err)
+	_, err = mq.Publish("deadlock.test", []byte("msg2"))
+	assert.NoError(t, err)
+
+	// Give the read loop time to pick up the messages and enter the blocking
+	// notify() path before we call Unsubscribe().
+	time.Sleep(100 * time.Millisecond)
+
+	// Unsubscribe must not deadlock. Run it in a goroutine and expect it to
+	// complete within 2 seconds.
+	done := make(chan struct{})
+	go func() {
+		sub.Unsubscribe()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(2 * time.Second):
+		t.Fatal("Unsubscribe() deadlocked: buffer.close() cannot acquire write lock while notify() holds read lock")
+	}
+}
+
 // This is a regression test for issue 6: DB connection leak in Close() error paths.
 // Before the fix, Close() returns early on ackWritten/metrics errors without calling
 // db.Close(), leaking one or more file descriptors per call. Running 10 iterations

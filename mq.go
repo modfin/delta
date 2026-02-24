@@ -605,14 +605,20 @@ type Subscription struct {
 	closeOnce  sync.Once
 	closed     bool
 	notifyChan chan Msg
+	doneChan   chan struct{} // closed when the subscription is closed; lets notify() abort without holding the write lock
 	notifyMu   sync.RWMutex
 	mu         sync.Mutex
 }
 
 func (s *Subscription) close() {
-	s.notifyMu.Lock()
-	defer s.notifyMu.Unlock()
+	// Signal doneChan first, without holding the write lock, so that any
+	// notify() call currently blocked in its select can wake up and release
+	// the read lock. Only then acquire the write lock to mark closed and
+	// close the data channel.
 	s.closeOnce.Do(func() {
+		close(s.doneChan)
+		s.notifyMu.Lock()
+		defer s.notifyMu.Unlock()
 		s.closed = true
 		close(s.notifyChan)
 	})
@@ -631,8 +637,13 @@ func (s *Subscription) notify(m Msg) {
 	if s.closed {
 		return
 	}
-	// TODO this could deadloack if no one is reading from the channel and we try to close it
-	s.notifyChan <- m
+	// Use a select so that a concurrent close() can signal doneChan and unblock
+	// this send without needing to acquire the write lock while we hold the read
+	// lock, which would otherwise cause a deadlock.
+	select {
+	case s.notifyChan <- m:
+	case <-s.doneChan:
+	}
 }
 
 func (s *Subscription) tryNotify(m Msg) (written bool) {
@@ -670,12 +681,14 @@ func (mq *MQ) Subscribe(topic string) (*Subscription, error) {
 		id:         uid,
 		topic:      topic,
 		notifyChan: make(chan Msg),
+		doneChan:   make(chan struct{}),
 	}
 	mq.stream.subs.Insert(s)
 	var unsubOnce sync.Once
 	s.Unsubscribe = func() {
 		unsubOnce.Do(func() {
 			mq.stream.subs.Remove(s)
+			close(s.doneChan)
 			close(s.notifyChan)
 		})
 	}
@@ -750,11 +763,13 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 		id:         uid(),
 		topic:      topic,
 		notifyChan: make(chan Msg),
+		doneChan:   make(chan struct{}),
 	}
 
 	sub.Unsubscribe = func() { // TODO can this produce a deadlock? between the main and the sub?
 		g.mu.Lock()
 		defer g.mu.Unlock()
+		close(sub.doneChan)
 		close(sub.notifyChan)
 		for i, s := range g.subs {
 			if s.id == sub.id {
@@ -791,11 +806,13 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 		id:         sub.id,
 		topic:      sub.topic,
 		notifyChan: make(chan Msg),
+		doneChan:   make(chan struct{}),
 	}
 
 	var unsubOnce sync.Once
 	s.Unsubscribe = func() {
 		unsubOnce.Do(func() {
+			close(s.doneChan)
 			close(s.notifyChan)
 		})
 	}
@@ -827,12 +844,14 @@ func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error)
 		id:         uid(),
 		topic:      topic,
 		notifyChan: make(chan Msg),
+		doneChan:   make(chan struct{}),
 	}
 
 	buffer := &Subscription{
 		id:         uid(),
 		topic:      topic,
 		notifyChan: make(chan Msg),
+		doneChan:   make(chan struct{}),
 	}
 
 	s.Unsubscribe = func() {
