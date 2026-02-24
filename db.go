@@ -206,10 +206,10 @@ func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() s
 
 	if err != nil {
 		if log != nil {
-			log.Error("[cove] iterKV, could not query in iter", "err", err)
+			log.Error("[delta] iterKV, could not query in iter", "err", err)
 			return func(yield func(msg Msg) bool) {}
 		}
-		_, _ = fmt.Fprintf(os.Stderr, "[cove] iterKV, could not query in iter, %v", err)
+		_, _ = fmt.Fprintf(os.Stderr, "[delta] iterKV, could not query in iter, %v", err)
 		return func(yield func(msg Msg) bool) {}
 
 	}
@@ -224,10 +224,10 @@ func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() s
 
 			if err != nil {
 				if log != nil {
-					log.Error("[cove] iterKV, could not scan in iter,", "err", err)
+					log.Error("[delta] iterKV, could not scan in iter", "err", err)
 					return
 				}
-				_, _ = fmt.Fprintf(os.Stderr, "cove: iterKV, could not scan in iter, %v", err)
+				_, _ = fmt.Fprintf(os.Stderr, "[delta] iterKV, could not scan in iter, %v", err)
 				return
 			}
 			if !yield(m) {
