@@ -38,7 +38,7 @@
     (Ping, pragmas, schema, optimize, metrics), the function returns an error without
     closing the database. Add a deferred db.Close() on error using a named return or
     cleanup variable.
-  status: pending
+  status: done
 
 - id: 6
   name: DB connection leak in Close() error paths

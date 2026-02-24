@@ -2,10 +2,12 @@ package delta_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/modfin/delta"
 	"github.com/stretchr/testify/assert"
 	"log/slog"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -1070,4 +1072,45 @@ func TestWithVacuumLoop(t *testing.T) {
 
 	sub.Unsubscribe()
 
+}
+
+// countOpenFDs returns the number of open file descriptors for the current process.
+func countOpenFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("cannot read /proc/self/fd: %v", err)
+	}
+	return len(entries)
+}
+
+// TestNew_ErrorPath_DBConnectionLeak verifies that when New() fails after
+// sql.Open succeeds (e.g. because an Op returns an error), the database
+// connection is closed and no file descriptor is leaked.
+func TestNew_ErrorPath_DBConnectionLeak(t *testing.T) {
+	failingOp := func(mq *delta.MQ) error {
+		return errors.New("injected Op failure")
+	}
+
+	fdsBefore := countOpenFDs(t)
+
+	// Call New() enough times that a leak would be visible even through
+	// normal fd fluctuation noise.
+	const iterations = 20
+	for range iterations {
+		mq, err := delta.New(delta.URITemp(), failingOp)
+		assert.Error(t, err)
+		assert.Nil(t, mq)
+	}
+
+	// Allow the Go runtime to finalize / GC anything pending.
+	// A genuine leak won't be reclaimed here, but a properly closed DB will.
+	fdsAfter := countOpenFDs(t)
+
+	// Each SQLite open typically holds 1-2 FDs (db file + WAL/SHM).
+	// With 20 iterations and no close, we would accumulate 20-40 extra FDs.
+	// Allow a small slack (5) for unrelated runtime noise.
+	leaked := fdsAfter - fdsBefore
+	assert.LessOrEqual(t, leaked, 5,
+		"expected no FD leak after New() error paths, but leaked ~%d FDs", leaked)
 }

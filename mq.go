@@ -136,9 +136,17 @@ func New(uri string, op ...Op) (*MQ, error) {
 		return nil, fmt.Errorf("could not open db, %w", err)
 	}
 
+	// Ensure db is closed on any error after sql.Open succeeds.
+	var initErr error
+	defer func() {
+		if initErr != nil {
+			_ = db.Close()
+		}
+	}()
+
 	// Test the connection
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("could not ping db, %w", err)
+	if initErr = db.Ping(); initErr != nil {
+		return nil, fmt.Errorf("could not ping db, %w", initErr)
 	}
 
 	c := &MQ{
@@ -173,27 +181,25 @@ func New(uri string, op ...Op) (*MQ, error) {
 
 	c.base.log.Debug("[delta] applying options")
 	for _, op := range ops {
-		err := op(c)
-		if err != nil {
-			return nil, fmt.Errorf("could not exec op, %w", err)
+		if initErr = op(c); initErr != nil {
+			return nil, fmt.Errorf("could not exec op, %w", initErr)
 		}
 	}
 
 	c.base.log.Debug("[delta] creating schema")
-	err = schema(c)
-	if err != nil {
-		return nil, fmt.Errorf("failed in creating schema, %w", err)
+	if initErr = schema(c); initErr != nil {
+		return nil, fmt.Errorf("failed in creating schema, %w", initErr)
 	}
 
 	c.base.log.Debug("[delta] optimizing database")
-	err = optimize(c)
-	if err != nil {
-		return nil, fmt.Errorf("failed in optimizing, %w", err)
+	if initErr = optimize(c); initErr != nil {
+		return nil, fmt.Errorf("failed in optimizing, %w", initErr)
 	}
 
 	written, read, err := metrics(c.base.db, c.tbl)
 	if err != nil {
-		return nil, fmt.Errorf("could not get written, %w", err)
+		initErr = err
+		return nil, fmt.Errorf("could not get written, %w", initErr)
 	}
 
 	c.base.log.Info("[delta] starting stream_ at", "written", written, "read", read, "stream_", c.stream)
