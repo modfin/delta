@@ -46,7 +46,7 @@
     In Close() at mq.go:295-308, if ackWritten or metrics fails for any stream, the
     function returns early without calling db.Close(). Use defer c.base.db.Close() or
     collect errors and always close.
-  status: pending
+  status: done
 
 - id: 7
   name: Stale stream on Stream() error

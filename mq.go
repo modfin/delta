@@ -308,19 +308,27 @@ func (c *MQ) Close() error {
 	}
 	c.base.streamMu.RUnlock()
 
+	// Always close the underlying DB connection, even if bookkeeping fails.
+	defer func() {
+		_ = c.base.db.Close()
+	}()
+
+	var errs []error
 	for _, cc := range streams {
 		err := ackWritten(cc.base.db, atomic.LoadUint64(&cc.stream.written), cc.tbl)
 		if err != nil {
-			return fmt.Errorf("could not ack written, %w", err)
+			errs = append(errs, fmt.Errorf("could not ack written, %w", err))
+			continue
 		}
 		w, r, err := metrics(cc.base.db, cc.tbl)
 		if err != nil {
-			return fmt.Errorf("could not get metrics, %w", err)
+			errs = append(errs, fmt.Errorf("could not get metrics, %w", err))
+			continue
 		}
 		c.base.log.Info("[delta] closing stream_", "stream_", cc.CurrentStream(), "written", w, "read", r)
 	}
 
-	return c.base.db.Close()
+	return errors.Join(errs...)
 }
 
 func RemoveStore(uri string, logger *slog.Logger) error {

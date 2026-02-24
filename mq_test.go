@@ -2,8 +2,10 @@ package delta_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/modfin/delta"
 	"github.com/stretchr/testify/assert"
 	"log/slog"
@@ -1156,4 +1158,57 @@ func TestNew_ErrorPath_DBConnectionLeak(t *testing.T) {
 	leaked := fdsAfter - fdsBefore
 	assert.LessOrEqual(t, leaked, 5,
 		"expected no FD leak after New() error paths, but leaked ~%d FDs", leaked)
+}
+
+// TestClose_DBLeakOnError verifies that Close() always closes the underlying
+// database connection even when ackWritten() or metrics() fails mid-loop.
+//
+// This is a regression test for issue 6: DB connection leak in Close() error paths.
+// Before the fix, Close() returns early on ackWritten/metrics errors without calling
+// db.Close(), leaking one or more file descriptors per call. Running 10 iterations
+// accumulates ~50+ leaked FDs, which is far above the allowed noise floor.
+func TestClose_DBLeakOnError(t *testing.T) {
+	fdsBefore := countOpenFDs(t)
+
+	const iterations = 10
+	for i := range iterations {
+		// Use a file-backed DB so SQLite holds real OS file descriptors.
+		dir := t.TempDir()
+		dbPath := dir + "/test.db"
+		uri := delta.URIFromPath(dbPath)
+
+		mq, err := delta.New(uri)
+		assert.NoError(t, err, "iteration %d: New() failed", i)
+		if mq == nil {
+			continue
+		}
+
+		// Publish so ackWritten() has meaningful work to do on Close().
+		_, err = mq.Publish("test.topic", []byte("hello"))
+		assert.NoError(t, err)
+
+		// Open a second, independent connection to the same SQLite file and drop
+		// the metadata table that ackWritten() writes to. After this, any call to
+		// ackWritten() on the original MQ connection fails with a SQL error,
+		// which triggers the early-return bug in Close().
+		sabotage, err := sql.Open("sqlite3", dbPath)
+		assert.NoError(t, err)
+		_, err = sabotage.Exec("DROP TABLE IF EXISTS _mq_delta_metadata")
+		assert.NoError(t, err)
+		assert.NoError(t, sabotage.Close())
+
+		// Close() must return an error AND still close the DB connection.
+		closeErr := mq.Close()
+		assert.Error(t, closeErr, "iteration %d: Close() should fail when metadata table is gone", i)
+	}
+
+	fdsAfter := countOpenFDs(t)
+
+	// Each un-closed SQLite connection holds ~3-6 FDs (db file, WAL, SHM, …).
+	// With the bug, 10 iterations leak ~50 FDs. Allow a generous slack of 10 for
+	// unrelated runtime noise (goroutines, temp files created by t.TempDir, etc.).
+	leaked := fdsAfter - fdsBefore
+	assert.LessOrEqual(t, leaked, 10,
+		"Close() leaked ~%d FDs across %d iterations; db.Close() must be called on all error paths",
+		leaked, iterations)
 }
