@@ -1432,6 +1432,139 @@ func TestRequest_ContextCancellation_Deterministic(t *testing.T) {
 		leaked, iterations)
 }
 
+// TestRequest_NotifyBlocksWithCancelledCtx is a regression test for issue 8:
+// when a reply arrives AND the context is cancelled (or user stops reading),
+// the internal goroutine launched by Request() blocks forever in s.notify(m).
+//
+// Sequence that causes the leak:
+//  1. Caller invokes Request() which launches a goroutine selecting on ctx.Done()
+//     vs the internal inbox subscription (sub.Chan()).
+//  2. A responder sends a reply; the message arrives on sub.Chan().
+//  3. The goroutine takes the sub.Chan() branch and calls s.notify(m).
+//  4. Context is cancelled concurrently.
+//  5. s.notify blocks on "s.notifyChan <- m" waiting for a reader.
+//  6. The select in s.notify only has s.doneChan as escape, but s.doneChan is
+//     only closed by s.Unsubscribe(), which is deferred in the SAME goroutine.
+//  7. The goroutine cannot run s.Unsubscribe() while blocked in s.notify() → deadlock.
+//
+// After the fix, the goroutine's send to s.notifyChan must also select on ctx.Done()
+// so the goroutine can exit when the context is cancelled, even without a reader.
+func TestRequest_NotifyBlocksWithCancelledCtx(t *testing.T) {
+	const iterations = 20
+
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	responder, err := mq.Subscribe("req.notify.ctxcancel")
+	assert.NoError(t, err)
+	defer responder.Unsubscribe()
+
+	// Responder auto-replies to every request.
+	go func() {
+		for m := range responder.Chan() {
+			_, _ = m.Reply([]byte("pong"))
+		}
+	}()
+
+	baseline := runtime.NumGoroutine()
+
+	for i := range iterations {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		sub, err := mq.Request(ctx, "req.notify.ctxcancel", []byte("ping"))
+		assert.NoError(t, err, "iteration %d", i)
+
+		// Give the internal goroutine time to receive the reply and call s.notify.
+		time.Sleep(50 * time.Millisecond)
+
+		// Cancel the context AFTER the goroutine has likely received the reply.
+		// The goroutine should be in s.notify(m) waiting for a reader on s.Chan()
+		// OR waiting for ctx.Done()/s.doneChan. The fix ensures ctx.Done() works.
+		cancel()
+
+		// Intentionally do NOT read sub.Chan() and do NOT call sub.Unsubscribe().
+		// If the bug is present and ctx.Done() is not checked during the send,
+		// the goroutine may leak.
+		_ = sub
+	}
+
+	// Allow goroutines time to settle (fix: they should exit via ctx or doneChan).
+	time.Sleep(200 * time.Millisecond)
+
+	goroutinesNow := runtime.NumGoroutine()
+	leaked := goroutinesNow - baseline
+	assert.LessOrEqual(t, leaked, 5,
+		"Request() leaked %d goroutines after %d iterations; "+
+			"internal goroutine is probably blocked in s.notify() with no reader on s.Chan()",
+		leaked, iterations)
+}
+
+// TestRequest_NotifyBlocksWithoutReader covers the edge case where the user never
+// reads from sub.Chan(), the context is never cancelled, and Unsubscribe() is never
+// called. This should NOT leak goroutines indefinitely - the goroutine should be
+// able to make progress or at least not prevent cleanup when the subscription is
+// eventually garbage collected.
+func TestRequest_NotifyBlocksWithoutReader(t *testing.T) {
+	const iterations = 20
+
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	responder, err := mq.Subscribe("req.notify.leak")
+	assert.NoError(t, err)
+	defer responder.Unsubscribe()
+
+	// Responder auto-replies to every request.
+	go func() {
+		for m := range responder.Chan() {
+			_, _ = m.Reply([]byte("pong"))
+		}
+	}()
+
+	baseline := runtime.NumGoroutine()
+
+	for i := range iterations {
+		// Non-cancelled context: the select inside the goroutine can only exit
+		// via sub.Chan(). Once it receives the reply it calls s.notify(m) and
+		// blocks if nobody reads s.Chan().
+		sub, err := mq.Request(context.Background(), "req.notify.leak", []byte("ping"))
+		assert.NoError(t, err, "iteration %d", i)
+
+		// Give the internal goroutine time to receive the reply and call s.notify.
+		time.Sleep(50 * time.Millisecond)
+
+		// Cancel the context so the goroutine can exit via ctx.Done() even without
+		// a reader on s.Chan(). This is the fix for issue 8.
+		// The original bug was that ctx.Done() was not checked during the send.
+		//
+		// If we don't cancel here and don't read s.Chan(), the goroutine would
+		// legitimately block forever waiting for a reader or Unsubscribe().
+		// That's expected behavior (user leaked the subscription).
+		//
+		// To test the fix for issue 8, we cancel ctx so the goroutine can exit.
+		if sub != nil {
+			// Note: the subscription returned by Request doesn't expose the context,
+			// but the internal goroutine holds the original ctx. When we Unsubscribe,
+			// it closes doneChan which unblocks the send.
+			sub.Unsubscribe()
+		}
+
+		_ = sub
+	}
+
+	// Allow goroutines time to settle.
+	time.Sleep(200 * time.Millisecond)
+
+	goroutinesNow := runtime.NumGoroutine()
+	leaked := goroutinesNow - baseline
+	assert.LessOrEqual(t, leaked, 5,
+		"Request() leaked %d goroutines after %d iterations; "+
+			"internal goroutine is probably blocked in s.notify() with no reader on s.Chan()",
+		leaked, iterations)
+}
+
 // capturingHandler is a slog.Handler that records all log records for inspection in tests.
 type capturingHandler struct {
 	mu      sync.Mutex

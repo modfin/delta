@@ -62,7 +62,7 @@
     In Request() at mq.go:759-770, if context is cancelled and the user stops reading
     from s.Chan(), s.notify() blocks forever. Use a select with ctx.Done() inside notify
     or use tryNotify instead.
-  status: pending
+  status: done
 
 - id: 9
   name: No panic recovery in background goroutines

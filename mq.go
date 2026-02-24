@@ -924,7 +924,21 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 		case <-ctx.Done():
 		case m, ok := <-sub.Chan():
 			if ok {
-				s.notify(m)
+				// Use a three-way select so that a concurrent context cancellation
+				// or an explicit Unsubscribe() (which closes s.doneChan) can unblock
+				// this send even when nobody is reading from s.Chan(). Without this
+				// the goroutine would block forever in s.notify() because s.doneChan
+				// is only closed by s.Unsubscribe(), which is deferred in this same
+				// goroutine and cannot run while the send is blocked.
+				s.notifyMu.RLock()
+				if !s.closed {
+					select {
+					case s.notifyChan <- m:
+					case <-s.doneChan:
+					case <-ctx.Done():
+					}
+				}
+				s.notifyMu.RUnlock()
 			}
 		}
 	}()
