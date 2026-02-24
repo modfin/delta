@@ -139,7 +139,7 @@
     Msg.Ack() at mq.go:368-370 is a no-op stub that returns nil. It is never called
     and never tested. Either remove it to avoid misleading users, or implement per-message
     acknowledgment.
-  status: pending
+  status: done
 
 - id: 30
   name: Default vacuum or unbounded growth warning

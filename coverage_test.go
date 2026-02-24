@@ -707,3 +707,83 @@ func TestConcurrentClose(t *testing.T) {
 	wg.Wait()
 	// No panic and no deadlock = success.
 }
+
+// ---------------------------------------------------------------------------
+// id:29 — Msg.Ack() should update the read-ack watermark
+// ---------------------------------------------------------------------------
+
+// TestMsgAck_UpdatesReadWatermark verifies that calling Msg.Ack() on a
+// received message advances the read-ack watermark so that VacuumOnReadAck
+// can delete the acknowledged message.
+//
+// Before the fix, Msg.Ack() is a no-op that returns nil without touching the
+// metadata table; VacuumOnReadAck therefore never advances beyond the normal
+// read-loop watermark, and messages that were explicitly Ack'd are not cleaned
+// up any faster than messages that were simply received.
+//
+// After the fix, Ack() must write the message's MessageId to the
+// {stream}_read metadata row, so that a subsequent VacuumOnReadAck call
+// deletes it.
+func TestMsgAck_UpdatesReadWatermark(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := time.Now()
+
+	// Publish two messages; we will Ack only the first one.
+	_, err = mq.Publish("ack.test", []byte("first"))
+	assert.NoError(t, err)
+	_, err = mq.Publish("ack.test", []byte("second"))
+	assert.NoError(t, err)
+
+	sub, err := mq.Subscribe("ack.test")
+	assert.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// Receive the first message and Ack it.
+	var first delta.Msg
+	select {
+	case first = <-sub.Chan():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for first message")
+	}
+
+	err = first.Ack()
+	assert.NoError(t, err, "Ack() must not return an error")
+
+	// Receive the second message but do NOT Ack it.
+	select {
+	case <-sub.Chan():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for second message")
+	}
+
+	// Give a moment for the read watermark to potentially be written.
+	time.Sleep(200 * time.Millisecond)
+
+	// Run vacuum.
+	delta.VacuumOnReadAck(mq)
+
+	// After vacuuming, a SubscribeFrom from the very beginning should no
+	// longer find the first message (it was Ack'd and therefore vacuum-eligible).
+	sub2, err := mq.SubscribeFrom("ack.test", start)
+	assert.NoError(t, err)
+	defer sub2.Unsubscribe()
+
+	select {
+	case m := <-sub2.Chan():
+		assert.NotEqual(t, []byte("first"), m.Payload,
+			"first message should have been vacuumed after Ack()")
+	case <-time.After(200 * time.Millisecond):
+		// No message at all is also acceptable (both were vacuumed).
+	}
+}
+
+// TestMsgAck_NoopOnZeroMsg verifies that calling Ack() on a zero-value Msg
+// (no mq reference) returns an error rather than panicking.
+func TestMsgAck_NoopOnZeroMsg(t *testing.T) {
+	var m delta.Msg
+	err := m.Ack()
+	assert.Error(t, err, "Ack() on a zero Msg should return an error")
+}

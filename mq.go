@@ -420,8 +420,15 @@ func (m *Msg) Reply(payload []byte) (Msg, error) {
 	return m.mq.write(reply)
 }
 
+// Ack acknowledges the message by advancing the read-ack watermark to at
+// least this message's MessageId. This allows VacuumOnReadAck to clean up
+// messages up to and including this one. Returns an error if the message was
+// not received through a subscriber (i.e. mq is nil).
 func (m *Msg) Ack() error {
-	return nil
+	if m.mq == nil {
+		return fmt.Errorf("message does not support ack")
+	}
+	return ackRead(m.mq.base.db, m.MessageId, m.mq.tbl)
 }
 
 func (mq *MQ) write(m Msg) (Msg, error) {
