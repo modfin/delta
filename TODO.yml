@@ -86,7 +86,7 @@
   description: >
     In log.go:10-12, the discard logger's Enabled() method returns true. It should return
     false to short-circuit log argument formatting and avoid wasted CPU.
-  status: pending
+  status: done
 
 - id: 12
   name: Temp directory permissions too open
