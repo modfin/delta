@@ -19,7 +19,7 @@ type query interface {
 
 const base_schema = `CREATE TABLE IF NOT EXISTS %s (
     			message_id BIGINT PRIMARY KEY,
-    			topic TEXT, 
+    			topic TEXT,
     			payload BLOB,
     			created_at BIGINT
 		 );`
@@ -42,26 +42,26 @@ func exec(db query, qs ...string) error {
 }
 
 func ackRead(db query, read uint64, tbl func() string) error {
-	q := fmt.Sprintf(`
-		INSERT INTO _mq_delta_metadata (key, value, created_at) 
-		VALUES ($1, CAST($2 AS TEXT), $3) 
+	q := `
+		INSERT INTO _mq_delta_metadata (key, value, created_at)
+		VALUES ($1, CAST($2 AS TEXT), $3)
 		ON CONFLICT (key)
-		    DO UPDATE 
-		    SET 
-		        value = excluded.value, 
-		        created_at = excluded.created_at`)
+		    DO UPDATE
+		    SET
+		        value = excluded.value,
+		        created_at = excluded.created_at`
 	_, err := db.Exec(q, tbl()+"_read", read, time.Now().UnixNano())
 	return err
 }
 func ackWritten(db query, written uint64, tbl func() string) error {
-	q := fmt.Sprintf(`
-		INSERT INTO _mq_delta_metadata (key, value, created_at) 
-		VALUES ($1, CAST($2 AS TEXT), $3) 
+	q := `
+		INSERT INTO _mq_delta_metadata (key, value, created_at)
+		VALUES ($1, CAST($2 AS TEXT), $3)
 		ON CONFLICT (key)
-		    DO UPDATE 
-		    SET 
-		        value = excluded.value, 
-		        created_at = excluded.created_at`)
+		    DO UPDATE
+		    SET
+		        value = excluded.value,
+		        created_at = excluded.created_at`
 	_, err := db.Exec(q, tbl()+"_written", written, time.Now().UnixNano())
 	return err
 }
@@ -73,8 +73,8 @@ func metrics(db query, tbl func() string) (written uint64, read uint64, err erro
 		   coalesce(
 		   		(SELECT CAST("value" as BIGINT )  FROM _mq_delta_metadata WHERE "key" = ($1 || '_read'))
 		   		, 1
-		   ) "read"	
-   	
+		   ) "read"
+
 	`, tbl())
 	r := db.QueryRow(q, tbl())
 
@@ -98,12 +98,12 @@ func persist(db query, m Msg, tbl func() string) error {
 func vacuumReadAck(db query, tbl func() string) (int64, error) {
 	table := tbl()
 	q := fmt.Sprintf(`
-	DELETE FROM %s 
+	DELETE FROM %s
     WHERE message_id < (
-        SELECT CAST("value" as BIGINT )  
-        FROM _mq_delta_metadata 
+        SELECT CAST("value" as BIGINT )
+        FROM _mq_delta_metadata
         WHERE "key" = ($1 || '_read')
-    ) 
+    )
     `, table)
 
 	r, err := db.Exec(q, table)
@@ -118,11 +118,11 @@ func vacuumReadAck(db query, tbl func() string) (int64, error) {
 func vacuumBefore(db query, before time.Time, tbl func() string) (int64, error) {
 	table := tbl()
 	q := fmt.Sprintf(`
-	DELETE FROM %s 
+	DELETE FROM %s
     WHERE created_at < $1
 	AND message_id < (
 		SELECT CAST("value" as BIGINT )
-		FROM _mq_delta_metadata 
+		FROM _mq_delta_metadata
 		WHERE "key" = ($2 || '_read')
     )
     `, table)
@@ -138,15 +138,15 @@ func vacuumBefore(db query, before time.Time, tbl func() string) (int64, error) 
 func vacuumKeep(db query, keep int, tbl func() string) (int64, error) {
 	table := tbl()
 	q := fmt.Sprintf(`
-	DELETE FROM %s 
+	DELETE FROM %s
     WHERE message_id NOT IN (
-	    SELECT message_id FROM %s 
+	    SELECT message_id FROM %s
 	    ORDER BY message_id DESC
 	    LIMIT $1
     )
     AND message_id < (
 		SELECT CAST("value" as BIGINT )
-		FROM _mq_delta_metadata 
+		FROM _mq_delta_metadata
 		WHERE "key" = ($2 || '_read')
     )
     `, table, table)
@@ -183,10 +183,10 @@ func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() s
 	var err error
 	if !glob {
 		rows, err = db.Query(fmt.Sprintf(`
-				SELECT message_id, topic, payload, created_at 
-				FROM %s 
-				WHERE topic = $1 
-				  AND created_at >= $2 
+				SELECT message_id, topic, payload, created_at
+				FROM %s
+				WHERE topic = $1
+				  AND created_at >= $2
 				  AND message_id <= $3
 				ORDER BY created_at`, tbl()), topic, from.UnixNano(), to)
 	}
@@ -195,11 +195,11 @@ func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() s
 		start, _, _ := strings.Cut(topic, "*")
 		start = start + "%"
 		rows, err = db.Query(fmt.Sprintf(`
-				SELECT message_id, topic, payload, created_at 
-				FROM %s 
-				WHERE topic like $1 
-				  AND match_glob(topic, $2) 
-				  AND created_at >= $3 
+				SELECT message_id, topic, payload, created_at
+				FROM %s
+				WHERE topic like $1
+				  AND match_glob(topic, $2)
+				  AND created_at >= $3
 				  AND message_id <= $4
 				ORDER BY created_at`, tbl()), start, topic, from.UnixNano(), to)
 	}

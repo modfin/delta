@@ -203,7 +203,7 @@ func New(uri string, op ...Op) (*MQ, error) {
 		return nil, fmt.Errorf("could not get written, %w", initErr)
 	}
 
-	c.base.log.Info("[delta] starting stream_ at", "written", written, "read", read, "stream_", c.stream)
+	c.base.log.Info("[delta] starting stream_ at", "written", written, "read", read, "stream_", c.stream.name)
 
 	atomic.SwapUint64(&c.stream.written, written)
 	atomic.SwapUint64(&c.stream.read, read) // Probably load some sort of read counter instead?
@@ -264,7 +264,7 @@ func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not get metrics, %w", err)
 	}
-	c.base.log.Info("[delta] starting stream_ at", "written", written, "read", read, "stream_", cc.stream)
+	c.base.log.Info("[delta] starting stream_ at", "written", written, "read", read, "stream_", cc.stream.name)
 
 	atomic.SwapUint64(&cc.stream.written, written)
 	atomic.SwapUint64(&cc.stream.read, read)
