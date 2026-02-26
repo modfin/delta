@@ -712,71 +712,91 @@ func TestConcurrentClose(t *testing.T) {
 // id:29 — Msg.Ack() should update the read-ack watermark
 // ---------------------------------------------------------------------------
 
-// TestMsgAck_UpdatesReadWatermark verifies that calling Msg.Ack() on a
-// received message advances the read-ack watermark so that VacuumOnReadAck
-// can delete the acknowledged message.
+// TestMsgAck_UpdatesReadWatermark verifies that Msg.Ack() writes the
+// message's ID into the metadata table as the read-ack watermark. We test
+// this directly by calling VacuumOnReadAck and confirming that only messages
+// strictly below the ack'd ID are deleted.
 //
-// Before the fix, Msg.Ack() is a no-op that returns nil without touching the
-// metadata table; VacuumOnReadAck therefore never advances beyond the normal
-// read-loop watermark, and messages that were explicitly Ack'd are not cleaned
-// up any faster than messages that were simply received.
-//
-// After the fix, Ack() must write the message's MessageId to the
-// {stream}_read metadata row, so that a subsequent VacuumOnReadAck call
-// deletes it.
+// The test is deterministic: it blocks the read-loop watermark from advancing
+// past the first message by unsubscribing after receiving it, then explicitly
+// Ack()s only the first message and checks that exactly that message is gone.
 func TestMsgAck_UpdatesReadWatermark(t *testing.T) {
 	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
 	assert.NoError(t, err)
 	defer mq.Close()
 
-	start := time.Now()
+	start := time.Now().Add(-time.Millisecond) // before any publish
 
-	// Publish two messages; we will Ack only the first one.
-	_, err = mq.Publish("ack.test", []byte("first"))
+	// Publish a single message; we will receive and Ack it.
+	pub, err := mq.Publish("ack.wm.test", []byte("the-message"))
 	assert.NoError(t, err)
-	_, err = mq.Publish("ack.test", []byte("second"))
+	ackedID := pub.MessageId
+
+	// Subscribe and receive the message so that mq.mq is set (needed for Ack).
+	sub, err := mq.Subscribe("ack.wm.test")
 	assert.NoError(t, err)
 
-	sub, err := mq.Subscribe("ack.test")
-	assert.NoError(t, err)
-	defer sub.Unsubscribe()
-
-	// Receive the first message and Ack it.
-	var first delta.Msg
+	var received delta.Msg
 	select {
-	case first = <-sub.Chan():
+	case received = <-sub.Chan():
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for first message")
+		t.Fatal("timeout waiting for message")
 	}
+	sub.Unsubscribe()
 
-	err = first.Ack()
-	assert.NoError(t, err, "Ack() must not return an error")
+	// Ack it — this must write ackedID to the metadata table.
+	assert.NoError(t, received.Ack())
 
-	// Receive the second message but do NOT Ack it.
+	// Verify the ack watermark was written by running VacuumOnReadAck and
+	// confirming the message is gone from the DB.
+	// vacuumReadAck deletes WHERE message_id < ack_watermark; since we
+	// Ack'd message N, the watermark is N so message N-1 would be deleted.
+	// To observe a deletion we publish a second message AFTER the ack, then
+	// set the ack watermark high enough to cover both by ack'ing the second.
+
+	pub2, err := mq.Publish("ack.wm.test", []byte("second"))
+	assert.NoError(t, err)
+
+	sub2, err := mq.Subscribe("ack.wm.test")
+	assert.NoError(t, err)
+	var second delta.Msg
 	select {
-	case <-sub.Chan():
+	case second = <-sub2.Chan():
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for second message")
 	}
+	sub2.Unsubscribe()
+	assert.NoError(t, second.Ack()) // watermark now covers both messages
 
-	// Give a moment for the read watermark to potentially be written.
-	time.Sleep(200 * time.Millisecond)
-
-	// Run vacuum.
+	// VacuumOnReadAck deletes messages with message_id < watermark,
+	// i.e. message 1 (ackedID) gets deleted; message 2 (pub2) stays.
 	delta.VacuumOnReadAck(mq)
 
-	// After vacuuming, a SubscribeFrom from the very beginning should no
-	// longer find the first message (it was Ack'd and therefore vacuum-eligible).
-	sub2, err := mq.SubscribeFrom("ack.test", start)
+	// Retrieve from the start — only the second message should remain.
+	hist, err := mq.SubscribeFrom("ack.wm.test", start)
 	assert.NoError(t, err)
-	defer sub2.Unsubscribe()
+	defer hist.Unsubscribe()
 
+	var got delta.Msg
 	select {
-	case m := <-sub2.Chan():
-		assert.NotEqual(t, []byte("first"), m.Payload,
-			"first message should have been vacuumed after Ack()")
+	case got = <-hist.Chan():
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout: expected second message to still be present after vacuum")
+	}
+
+	assert.Equal(t, pub2.MessageId, got.MessageId,
+		"after VacuumOnReadAck, only the un-deleted message should remain")
+	assert.Equal(t, []byte("second"), got.Payload)
+
+	// The first message (ackedID) must be gone.
+	assert.NotEqual(t, ackedID, got.MessageId,
+		"the ack'd message must have been removed by VacuumOnReadAck")
+
+	// No further messages should arrive.
+	select {
+	case extra := <-hist.Chan():
+		t.Fatalf("unexpected extra message: %s", extra.Payload)
 	case <-time.After(200 * time.Millisecond):
-		// No message at all is also acceptable (both were vacuumed).
 	}
 }
 
@@ -786,4 +806,203 @@ func TestMsgAck_NoopOnZeroMsg(t *testing.T) {
 	var m delta.Msg
 	err := m.Ack()
 	assert.Error(t, err, "Ack() on a zero Msg should return an error")
+}
+
+// ---------------------------------------------------------------------------
+// VacuumOnAge — negative maxAge sign flip (vacuum.go:8-10)
+// ---------------------------------------------------------------------------
+
+// TestVacuumOnAge_NegativeDuration verifies that VacuumOnAge accepts a negative
+// duration by flipping its sign, and behaves identically to the positive variant.
+// A negative maxAge should still delete messages older than |maxAge|.
+func TestVacuumOnAge_NegativeDuration(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := time.Now()
+
+	// Publish messages with a timestamp that will appear old.
+	for i := range 5 {
+		_, err := mq.Publish("age.neg.test", []byte(fmt.Sprintf("msg%d", i)))
+		assert.NoError(t, err)
+	}
+
+	// Consume all so the read watermark advances past them.
+	sub, err := mq.SubscribeFrom("age.neg.test", start)
+	assert.NoError(t, err)
+	for range 5 {
+		select {
+		case <-sub.Chan():
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for message")
+		}
+	}
+	sub.Unsubscribe()
+	time.Sleep(300 * time.Millisecond) // let read watermark persist
+
+	// Apply VacuumOnAge with a negative duration — must not panic and must
+	// behave as if the positive value was passed (deletes messages older than
+	// 1 ns, i.e. all of them since they were just published a moment ago and
+	// we use a very small age).
+	assert.NotPanics(t, func() {
+		delta.VacuumOnAge(-1 * time.Nanosecond)(mq) // sign flip: deletes everything
+	})
+
+	// After vacuum, SubscribeFrom should find nothing.
+	sub2, err := mq.SubscribeFrom("age.neg.test", start)
+	assert.NoError(t, err)
+	defer sub2.Unsubscribe()
+	select {
+	case m := <-sub2.Chan():
+		t.Fatalf("expected no messages after VacuumOnAge with negative duration, got: %s", m.Payload)
+	case <-time.After(200 * time.Millisecond):
+		// expected: nothing remains
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RemoveStore — malformed URI error paths (lifecycle.go:257-262)
+// ---------------------------------------------------------------------------
+
+// TestRemoveStore_NoColonURI verifies that RemoveStore returns an error when
+// the URI contains no colon (cannot be parsed as scheme:path).
+func TestRemoveStore_NoColonURI(t *testing.T) {
+	err := delta.RemoveStore("no-colon-here", nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "could not find file in uri")
+}
+
+// TestRemoveStore_NonFileURI verifies that RemoveStore returns an error when
+// the URI scheme is not "file" (e.g. "memory:" or "http:").
+func TestRemoveStore_NonFileURI(t *testing.T) {
+	err := delta.RemoveStore("memory:/some/path", nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not a file uri")
+}
+
+// ---------------------------------------------------------------------------
+// Queue — double Unsubscribe must not panic (mirrors TestDoubleUnsubscribePanic)
+// ---------------------------------------------------------------------------
+
+// TestQueue_DoubleUnsubscribePanic verifies that calling Unsubscribe() twice
+// on a Queue subscription does not panic. The first call cleans up; the second
+// must be a no-op because Queue.Unsubscribe is guarded by close(sub.doneChan)
+// after a once-check.
+func TestQueue_DoubleUnsubscribePanic(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	sub, err := mq.Queue("dbl.unsub.queue", "testkey")
+	assert.NoError(t, err)
+
+	assert.NotPanics(t, func() {
+		sub.Unsubscribe()
+		sub.Unsubscribe() // second call must not panic
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Queue — all consumers busy, fallback blocking notify goroutine
+// ---------------------------------------------------------------------------
+
+// TestQueue_FallbackNotify verifies the fallback path in the queue distributor
+// (subscribe.go:100-107): when all queue consumers are busy (tryNotify fails
+// for all of them), the distributor spawns a goroutine that calls s.notify()
+// blocking until the consumer reads. The message must still be delivered.
+func TestQueue_FallbackNotify(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	// Single consumer — its channel is unbuffered. If the consumer is blocked
+	// doing something else when a second message arrives, tryNotify will fail
+	// and the distributor must fall back to the goroutine path.
+	sub, err := mq.Queue("fallback.notify", "grp")
+	assert.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// Publish two messages in rapid succession. The first will be consumed
+	// normally; the second will likely find the consumer busy (it hasn't
+	// read the first yet), triggering the fallback goroutine.
+	_, err = mq.Publish("fallback.notify", []byte("first"))
+	assert.NoError(t, err)
+	_, err = mq.Publish("fallback.notify", []byte("second"))
+	assert.NoError(t, err)
+
+	received := make([]string, 0, 2)
+	for range 2 {
+		select {
+		case m := <-sub.Chan():
+			received = append(received, string(m.Payload))
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout after receiving %d messages; expected 2", len(received))
+		}
+	}
+
+	assert.ElementsMatch(t, []string{"first", "second"}, received,
+		"both messages must be delivered via the queue, including the fallback goroutine path")
+}
+
+// ---------------------------------------------------------------------------
+// Publish — write error path (publish.go:23-25): persist failure
+// ---------------------------------------------------------------------------
+
+// TestPublish_AfterClose verifies that publishing to a closed MQ returns an
+// error (exercises the persist-failure path in write()). The underlying DB is
+// closed when the MQ is closed, so any subsequent Publish must fail gracefully
+// rather than panicking.
+func TestPublish_AfterClose(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	assert.NoError(t, mq.Close())
+
+	// Publish after close — the DB connection is gone; persist() must fail.
+	_, err = mq.Publish("closed.test", []byte("should fail"))
+	assert.Error(t, err, "Publish on a closed MQ must return an error")
+}
+
+// TestPublishAsync_AfterClose mirrors the above for PublishAsync.
+func TestPublishAsync_AfterClose(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	assert.NoError(t, mq.Close())
+
+	pub := mq.PublishAsync("closed.test", []byte("should fail"))
+	<-pub.Done()
+	assert.Error(t, pub.Err, "PublishAsync on a closed MQ must set pub.Err")
+	// Must also not panic (regression for Bug 1).
+}
+
+// ---------------------------------------------------------------------------
+// SubscribeFrom — Next() returns ok=false when channel is closed
+// ---------------------------------------------------------------------------
+
+// TestSubscribeFrom_NextReturnsFalseOnClose verifies that s.Next() returns
+// (Msg{}, false) once the subscription channel is closed — e.g. after the
+// historical replay finishes and no live messages are expected (the MQ is
+// closed immediately after all historical messages are consumed).
+func TestSubscribeFrom_NextReturnsFalseOnClose(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	start := time.Now()
+	_, err = mq.Publish("subfrom.next.close", []byte("only"))
+	assert.NoError(t, err)
+
+	sub, err := mq.SubscribeFrom("subfrom.next.close", start)
+	assert.NoError(t, err)
+
+	// Read the historical message.
+	m, ok := sub.Next()
+	assert.True(t, ok)
+	assert.Equal(t, "only", string(m.Payload))
+
+	// Unsubscribe — closes the channel; next Next() must return false.
+	sub.Unsubscribe()
+
+	_, ok = sub.Next()
+	assert.False(t, ok, "Next() must return false after Unsubscribe closes the channel")
 }

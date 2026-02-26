@@ -322,6 +322,51 @@ func TestSimpleSubFrom_joininghistory_with_live2(t *testing.T) {
 
 }
 
+// TestSubscribeFrom_UnsubscribeEarlyNoLeak is a regression test for a goroutine
+// leak in SubscribeFrom: when Unsubscribe() is called before the historical replay
+// goroutine finishes (or while nobody reads s.Chan()), two goroutines used to block
+// forever — the historical replay goroutine blocked in s.notify(), and the live
+// forwarding goroutine waiting for buffer.Chan() to close.
+//
+// The fix: s.Unsubscribe() now also calls s.close(), which closes s.doneChan and
+// causes any in-progress s.notify() to unblock via its doneChan select arm.
+func TestSubscribeFrom_UnsubscribeEarlyNoLeak(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	// Publish enough messages that the historical replay goroutine is guaranteed
+	// to still be running when we call Unsubscribe.
+	const msgCount = 2000
+	for i := range msgCount {
+		_, err := mq.Publish("subfrom.leak.test", []byte(strconv.Itoa(i)))
+		assert.NoError(t, err)
+	}
+
+	goroutinesBefore := runtime.NumGoroutine()
+
+	const iterations = 10
+	for range iterations {
+		sub, err := mq.SubscribeFrom("subfrom.leak.test", time.Time{})
+		assert.NoError(t, err)
+
+		// Let the goroutines start and the historical replay potentially block.
+		time.Sleep(5 * time.Millisecond)
+
+		// Unsubscribe without reading a single message — previously leaked 2 goroutines.
+		sub.Unsubscribe()
+	}
+
+	// Give goroutines time to drain.
+	time.Sleep(500 * time.Millisecond)
+
+	goroutinesAfter := runtime.NumGoroutine()
+	leaked := goroutinesAfter - goroutinesBefore
+	assert.LessOrEqual(t, leaked, 2,
+		"SubscribeFrom goroutines must exit after Unsubscribe(); leaked %d goroutines across %d iterations",
+		leaked, iterations)
+}
+
 func TestSimpleStream(t *testing.T) {
 	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
 	assert.NoError(t, err)
@@ -726,6 +771,21 @@ func TestPublishAsync(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		assert.Fail(t, "timeout")
 	}
+}
+
+// TestPublishAsync_InvalidTopic is a regression test for a nil-pointer panic:
+// when Publish() fails (e.g. invalid topic), it returns (nil, err).
+// PublishAsync used to dereference that nil pointer unconditionally.
+func TestPublishAsync_InvalidTopic(t *testing.T) {
+	mq, err := delta.New(delta.URITemp(), delta.DBRemoveOnClose())
+	assert.NoError(t, err)
+	defer mq.Close()
+
+	assert.NotPanics(t, func() {
+		pub := mq.PublishAsync("invalid topic!", []byte("hello"))
+		<-pub.Done()
+		assert.Error(t, pub.Err, "expected an error for an invalid topic")
+	})
 }
 
 func TestQueueMultipleConsumers(t *testing.T) {

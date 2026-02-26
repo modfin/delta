@@ -200,6 +200,53 @@ func TestGlobTopic_InsertAndMatch(t *testing.T) {
 	}
 }
 
+// TestGlobTopic_Remove_NonExistentPath exercises the early-return in Remove()
+// when the subscription's path does not exist in the trie. This covers the
+// `if _, ok := node.children[part]; !ok { return }` branch (previously 0%).
+func TestGlobTopic_Remove_NonExistentPath(t *testing.T) {
+	trie := newGlobber[glob]()
+	trie.Insert(glob{"1", "a.b.c"})
+
+	// Remove a topic whose path diverges at the second segment — "x" is
+	// never a child of the root node.
+	trie.Remove(glob{"99", "a.x.c"}) // must not panic or mutate state
+
+	// The original entry must still match.
+	matches := trie.Match("a.b.c")
+	assert.Len(t, matches, 1)
+	assert.Equal(t, "1", matches[0].Id())
+
+	// Remove a completely absent top-level path.
+	trie.Remove(glob{"99", "z.z.z"}) // must not panic
+	matches = trie.Match("a.b.c")
+	assert.Len(t, matches, 1)
+
+	// Remove an entry whose ID does not appear in the matching node's subs
+	// (path exists but ID is wrong) — iterates node.subs without finding it.
+	trie.Remove(glob{"nonexistent-id", "a.b.c"})
+	matches = trie.Match("a.b.c")
+	assert.Len(t, matches, 1, "wrong-ID remove must leave existing sub intact")
+}
+
+// TestGlobTopic_Print exercises Print() and printRecursive() which were at 0%
+// coverage. We only verify the call doesn't panic; output goes to stdout.
+func TestGlobTopic_Print(t *testing.T) {
+	trie := newGlobber[glob]()
+	// Empty trie — should not panic.
+	assert.NotPanics(t, trie.Print)
+
+	// Populated trie with multiple patterns.
+	for _, g := range []glob{
+		{"1", "a.b.c"},
+		{"2", "a.*.c"},
+		{"3", "a.**"},
+		{"4", "x.y"},
+	} {
+		trie.Insert(g)
+	}
+	assert.NotPanics(t, trie.Print)
+}
+
 func TestGlobTopic_Remove2(t *testing.T) {
 
 	var emptyLeaf func(g *globber[glob], path []string) bool

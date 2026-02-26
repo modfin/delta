@@ -72,7 +72,9 @@ func (mq *MQ) PublishAsync(topic string, payload []byte) *Publication {
 	}
 	go func() {
 		p, err := mq.Publish(topic, payloadCopy)
-		pub.Msg = p.Msg
+		if p != nil {
+			pub.Msg = p.Msg
+		}
 		pub.Err = err
 		close(pub.done)
 	}()

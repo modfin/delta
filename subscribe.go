@@ -117,24 +117,27 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 		doneChan:   make(chan struct{}),
 	}
 
+	var unsubOnce sync.Once
 	sub.Unsubscribe = func() { // TODO can this produce a deadlock? between the main and the sub?
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		close(sub.doneChan)
-		close(sub.notifyChan)
-		for i, s := range g.subs {
-			if s.id == sub.id {
-				g.subs = append(g.subs[:i], g.subs[i+1:]...)
-				break
+		unsubOnce.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			close(sub.doneChan)
+			close(sub.notifyChan)
+			for i, s := range g.subs {
+				if s.id == sub.id {
+					g.subs = append(g.subs[:i], g.subs[i+1:]...)
+					break
+				}
 			}
-		}
 
-		if len(g.subs) == 0 {
-			mq.stream.groupMu.Lock()
-			g.main.Unsubscribe()
-			delete(mq.stream.groups, key)
-			mq.stream.groupMu.Unlock()
-		}
+			if len(g.subs) == 0 {
+				mq.stream.groupMu.Lock()
+				g.main.Unsubscribe()
+				delete(mq.stream.groups, key)
+				mq.stream.groupMu.Unlock()
+			}
+		})
 	}
 
 	g.subs = append(g.subs, sub)
@@ -227,6 +230,7 @@ func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error)
 	s.Unsubscribe = func() {
 		mq.stream.subs.Remove(buffer)
 		buffer.close()
+		s.close() // unblocks the historical replay goroutine if it is blocked in s.notify()
 	}
 
 	go func() {
@@ -254,7 +258,11 @@ func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error)
 				}
 				s.notify(m)
 			}
-			close(s.notifyChan)
+			// buffer.Chan() is exhausted (buffer was closed). Close the outer
+			// subscription so that callers blocked on s.Chan() or s.Next() unblock.
+			// s.close() is idempotent via closeOnce, so it is safe even if
+			// s.Unsubscribe() already called it.
+			s.close()
 		}()
 
 		var last time.Time
