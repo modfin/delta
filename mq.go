@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-type Op func(*MQ) error
-
 func dbPragma(pragma string) Op {
 	return func(c *MQ) error {
 		return exec(c.base.db,
@@ -19,18 +17,21 @@ func dbPragma(pragma string) Op {
 	}
 }
 
-// DBSyncOff is a helper function to set
+// Op configures an MQ instance during New or Stream creation.
 //
-//	synchronous = off
+// Returning an error aborts construction.
+type Op func(*MQ) error
+
+// DBSyncOff configures SQLite with synchronous=off.
 //
-// this is useful for write performance but effects read performance and durability
+// This improves write throughput at the cost of durability and crash safety.
 func DBSyncOff() Op {
 	return func(c *MQ) error {
 		return dbPragma("synchronous = off")(c)
 	}
 }
 
-// DBRemoveOnClose is a helper function to remove the database files on close
+// DBRemoveOnClose removes backing database files when MQ.Close is called.
 func DBRemoveOnClose() Op {
 	return func(mq *MQ) error {
 		mq.base.removeOnClose = true
@@ -38,7 +39,9 @@ func DBRemoveOnClose() Op {
 	}
 }
 
-// WithLogger sets the logger for the cache
+// WithLogger sets the logger used by MQ background loops and internals.
+//
+// Passing nil disables logging by using a discard logger.
 func WithLogger(log *slog.Logger) Op {
 	return func(c *MQ) error {
 		if log == nil {
@@ -49,7 +52,9 @@ func WithLogger(log *slog.Logger) Op {
 	}
 }
 
-// WithVacuum sets the logger for the cache
+// WithVacuum enables periodic message cleanup.
+//
+// vacuum is executed every interval in the background vacuum loop.
 func WithVacuum(vacuum VacuumFunc, interval time.Duration) Op {
 	return func(c *MQ) error {
 		c.base.vacuum = vacuum
@@ -69,6 +74,9 @@ func dbDefault() Op {
 	}
 }
 
+// VacuumFunc is a cleanup strategy run by the vacuum loop.
+//
+// Implementations can remove old messages based on stream policy.
 type VacuumFunc func(*MQ)
 type base_ struct {
 	//shards
@@ -102,6 +110,9 @@ type stream_ struct {
 	groups  map[string]*group
 }
 
+// MQ is a SQLite-backed message queue stream.
+//
+// It supports publish/subscribe, queue groups, request/reply, and replay.
 type MQ struct {
 	base   *base_
 	stream stream_

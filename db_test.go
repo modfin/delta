@@ -167,7 +167,8 @@ func openFreshDB(t *testing.T, n int) (*sql.DB, func() string) {
 	)`)
 	assert.NoError(t, err)
 
-	// Seed a read watermark well above all messages so vacuum can delete.
+	// Seed the legacy read key (without _cursor suffix) to verify fallback
+	// compatibility for existing DBs.
 	_, err = db.Exec(`INSERT INTO _mq_delta_metadata (key, value, created_at)
 		VALUES ('_mq_delta_stream_default_read', '9999', 0)`)
 	assert.NoError(t, err)
@@ -180,16 +181,6 @@ func openFreshDB(t *testing.T, n int) (*sql.DB, func() string) {
 		assert.NoError(t, err)
 	}
 	return db, tbl
-}
-
-// TestVacuumReadAck_DBError exercises the error return path of vacuumReadAck
-// (db.go:111-113) by closing the DB before calling it.
-func TestVacuumReadAck_DBError(t *testing.T) {
-	db, tbl := openFreshDB(t, 5)
-	db.Close() // force all subsequent Exec calls to fail
-
-	_, err := vacuumReadAck(db, tbl)
-	assert.Error(t, err, "vacuumReadAck must return an error when the DB is closed")
 }
 
 // TestVacuumBefore_DBError exercises the error return path of vacuumBefore
@@ -277,31 +268,4 @@ func TestVacuumOnAge_LogsError(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "VacuumOnAge must log a vacuuming error when the DB is closed")
-}
-
-// TestVacuumOnReadAck_LogsError verifies VacuumOnReadAck handles DB errors
-// without panicking — exercises vacuum.go:52-55.
-func TestVacuumOnReadAck_LogsError(t *testing.T) {
-	h := &capturingHandler{}
-	log := slog.New(h)
-
-	mq, err := New(URITemp(), DBRemoveOnClose(), WithLogger(log))
-	assert.NoError(t, err)
-	defer mq.Close()
-
-	mq.base.db.Close()
-
-	assert.NotPanics(t, func() {
-		VacuumOnReadAck(mq)
-	})
-
-	msgs := h.captured()
-	found := false
-	for _, m := range msgs {
-		if strings.Contains(m, "vacuuming error") {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "VacuumOnReadAck must log a vacuuming error when the DB is closed")
 }

@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// Msg is a message persisted in a stream.
+//
+// Msg values are delivered to subscribers and can be replied to when they
+// originate from a live subscription.
 type Msg struct {
 	mq        *MQ
 	MessageId uint64
@@ -14,6 +18,9 @@ type Msg struct {
 	At        time.Time
 }
 
+// Reply publishes a reply message to this message's inbox topic.
+//
+// It returns an error when the message was not delivered from a live MQ.
 func (m *Msg) Reply(payload []byte) (Msg, error) {
 	if m.mq == nil {
 		return Msg{}, fmt.Errorf("message does not support reply")
@@ -25,27 +32,23 @@ func (m *Msg) Reply(payload []byte) (Msg, error) {
 	return m.mq.write(reply)
 }
 
-// Ack acknowledges the message by advancing the read-ack watermark to at
-// least this message's MessageId. This allows VacuumOnReadAck to clean up
-// messages up to and including this one. Returns an error if the message was
-// not received through a subscriber (i.e. mq is nil).
-func (m *Msg) Ack() error {
-	if m.mq == nil {
-		return fmt.Errorf("message does not support ack")
-	}
-	return ackRead(m.mq.base.db, m.MessageId, m.mq.tbl)
-}
-
+// Publication is the result of a publish operation.
+//
+// For PublishAsync, wait on Done and then inspect Err.
 type Publication struct {
 	Msg
 	Err  error
 	done chan struct{}
 }
 
+// Done returns a channel that is closed when the publish operation finishes.
 func (p *Publication) Done() <-chan struct{} {
 	return p.done
 }
 
+// Subscription represents an active topic subscription.
+//
+// Messages are delivered on Chan until Unsubscribe is called.
 type Subscription struct {
 	id          string
 	topic       string
@@ -73,10 +76,12 @@ func (s *Subscription) close() {
 	})
 }
 
+// Topic returns the subscription's normalized topic pattern.
 func (s *Subscription) Topic() string {
 	return s.topic
 }
 
+// Id returns the unique identifier for this subscription.
 func (s *Subscription) Id() string {
 	return s.id
 }
@@ -110,10 +115,14 @@ func (s *Subscription) tryNotify(m Msg) (written bool) {
 	}
 }
 
+// Chan returns the channel used to deliver subscription messages.
 func (s *Subscription) Chan() <-chan Msg {
 	return s.notifyChan
 }
 
+// Next blocks until the next message arrives or the subscription closes.
+//
+// The boolean return value is false when the subscription is closed.
 func (s *Subscription) Next() (Msg, bool) {
 	m, ok := <-s.notifyChan
 	return m, ok

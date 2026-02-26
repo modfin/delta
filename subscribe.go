@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// Subscribe creates a live Pub/Sub subscription for topic.
+//
+// The returned subscription receives future matching messages until Unsubscribe.
 func (mq *MQ) Subscribe(topic string) (*Subscription, error) {
 	uid := uid()
 
@@ -43,6 +46,10 @@ type group struct {
 	subs []*Subscription
 }
 
+// Queue creates a load-balanced subscription group for topic and key.
+//
+// Subscribers with the same topic/key compete so each message is delivered to
+// one subscriber in that group.
 func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 
 	topic, err := checkTopic(topic)
@@ -144,6 +151,10 @@ func (mq *MQ) Queue(topic string, key string) (*Subscription, error) {
 	return sub, nil
 }
 
+// Request publishes a request and returns a subscription for the first reply.
+//
+// The returned subscription is closed when context is canceled or when a reply
+// has been forwarded.
 func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subscription, error) {
 
 	m, err := mq.Publish(topic, payload)
@@ -207,6 +218,8 @@ func (mq *MQ) Request(ctx context.Context, topic string, payload []byte) (*Subsc
 
 }
 
+// SubscribeFrom creates a subscription that replays messages from time 'from'
+// and then continues with live messages.
 func (mq *MQ) SubscribeFrom(topic string, from time.Time) (*Subscription, error) {
 	topic, err := checkTopic(topic)
 	if err != nil {

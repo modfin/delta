@@ -41,7 +41,7 @@ func exec(db query, qs ...string) error {
 	return nil
 }
 
-func ackRead(db query, read uint64, tbl func() string) error {
+func checkpointReadCursor(db query, read uint64, tbl func() string) error {
 	q := `
 		INSERT INTO _mq_delta_metadata (key, value, created_at)
 		VALUES ($1, CAST($2 AS TEXT), $3)
@@ -50,10 +50,10 @@ func ackRead(db query, read uint64, tbl func() string) error {
 		    SET
 		        value = excluded.value,
 		        created_at = excluded.created_at`
-	_, err := db.Exec(q, tbl()+"_read", read, time.Now().UnixNano())
+	_, err := db.Exec(q, tbl()+"_read_cursor", read, time.Now().UnixNano())
 	return err
 }
-func ackWritten(db query, written uint64, tbl func() string) error {
+func checkpointWrittenCursor(db query, written uint64, tbl func() string) error {
 	q := `
 		INSERT INTO _mq_delta_metadata (key, value, created_at)
 		VALUES ($1, CAST($2 AS TEXT), $3)
@@ -62,15 +62,16 @@ func ackWritten(db query, written uint64, tbl func() string) error {
 		    SET
 		        value = excluded.value,
 		        created_at = excluded.created_at`
-	_, err := db.Exec(q, tbl()+"_written", written, time.Now().UnixNano())
+	_, err := db.Exec(q, tbl()+"_written_cursor", written, time.Now().UnixNano())
 	return err
 }
 
 func metrics(db query, tbl func() string) (written uint64, read uint64, err error) {
 	q := fmt.Sprintf(`
 		SELECT
-   	       (SELECT coalesce(MAX(message_id), 0) FROM %s ) as "written",
+	   	       (SELECT coalesce(MAX(message_id), 0) FROM %s ) as "written",
 		   coalesce(
+		   		(SELECT CAST("value" as BIGINT )  FROM _mq_delta_metadata WHERE "key" = ($1 || '_read_cursor')),
 		   		(SELECT CAST("value" as BIGINT )  FROM _mq_delta_metadata WHERE "key" = ($1 || '_read'))
 		   		, 1
 		   ) "read"
@@ -95,35 +96,17 @@ func persist(db query, m Msg, tbl func() string) error {
 	return err
 }
 
-func vacuumReadAck(db query, tbl func() string) (int64, error) {
-	table := tbl()
-	q := fmt.Sprintf(`
-	DELETE FROM %s
-    WHERE message_id < (
-        SELECT CAST("value" as BIGINT )
-        FROM _mq_delta_metadata
-        WHERE "key" = ($1 || '_read')
-    )
-    `, table)
-
-	r, err := db.Exec(q, table)
-
-	if err != nil {
-		return 0, err
-	}
-
-	return r.RowsAffected()
-}
-
 func vacuumBefore(db query, before time.Time, tbl func() string) (int64, error) {
 	table := tbl()
 	q := fmt.Sprintf(`
 	DELETE FROM %s
     WHERE created_at < $1
 	AND message_id < (
-		SELECT CAST("value" as BIGINT )
-		FROM _mq_delta_metadata
-		WHERE "key" = ($2 || '_read')
+		SELECT coalesce(
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read_cursor')),
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read')),
+			1
+		)
     )
     `, table)
 
@@ -145,9 +128,11 @@ func vacuumKeep(db query, keep int, tbl func() string) (int64, error) {
 	    LIMIT $1
     )
     AND message_id < (
-		SELECT CAST("value" as BIGINT )
-		FROM _mq_delta_metadata
-		WHERE "key" = ($2 || '_read')
+		SELECT coalesce(
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read_cursor')),
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read')),
+			1
+		)
     )
     `, table, table)
 

@@ -1222,7 +1222,7 @@ func TestNew_ErrorPath_DBConnectionLeak(t *testing.T) {
 }
 
 // TestClose_DBLeakOnError verifies that Close() always closes the underlying
-// database connection even when ackWritten() or metrics() fails mid-loop.
+// database connection even when written cursor checkpointing or metrics() fails mid-loop.
 //
 // TestRemoveStore_NoWALSHM is a regression test for issue 14: RemoveStore returns an
 // error when WAL or SHM files are absent. After a clean shutdown SQLite removes the
@@ -1304,7 +1304,7 @@ func TestNotifyDeadlock(t *testing.T) {
 }
 
 // This is a regression test for issue 6: DB connection leak in Close() error paths.
-// Before the fix, Close() returns early on ackWritten/metrics errors without calling
+// Before the fix, Close() returns early on written-cursor checkpoint/metrics errors without calling
 // db.Close(), leaking one or more file descriptors per call. Running 10 iterations
 // accumulates ~50+ leaked FDs, which is far above the allowed noise floor.
 func TestClose_DBLeakOnError(t *testing.T) {
@@ -1324,13 +1324,13 @@ func TestClose_DBLeakOnError(t *testing.T) {
 			continue
 		}
 
-		// Publish so ackWritten() has meaningful work to do on Close().
+		// Publish so written cursor checkpointing has meaningful work to do on Close().
 		_, err = mq.Publish("test.topic", []byte("hello"))
 		assert.NoError(t, err)
 
 		// Open a second, independent connection to the same SQLite file and drop
-		// the metadata table that ackWritten() writes to. After this, any call to
-		// ackWritten() on the original MQ connection fails with a SQL error,
+		// the metadata table that checkpointWrittenCursor() writes to. After this,
+		// any call to checkpointWrittenCursor() on the original MQ connection fails with a SQL error,
 		// which triggers the early-return bug in Close().
 		sabotage, err := sql.Open("sqlite3", dbPath)
 		assert.NoError(t, err)

@@ -4,6 +4,9 @@ import (
 	"time"
 )
 
+// VacuumOnAge returns a vacuum strategy that removes messages older than maxAge.
+//
+// Negative maxAge values are treated as their absolute value.
 func VacuumOnAge(maxAge time.Duration) VacuumFunc {
 	if maxAge < 0 {
 		maxAge = -maxAge
@@ -26,6 +29,9 @@ func VacuumOnAge(maxAge time.Duration) VacuumFunc {
 	}
 }
 
+// VacuumKeepN returns a vacuum strategy that keeps the N newest messages.
+//
+// Older messages are removed when they are below the persisted read cursor.
 func VacuumKeepN(n int) VacuumFunc {
 	return func(mq *MQ) {
 		l := mq.base.log.With("type", "keep-n")
@@ -41,20 +47,4 @@ func VacuumKeepN(n int) VacuumFunc {
 		}
 
 	}
-}
-
-func VacuumOnReadAck(mq *MQ) {
-	l := mq.base.log.With("type", "read-ack")
-
-	l.Info("[delta] vacuuming", "stream", mq.CurrentStream())
-
-	removed, err := vacuumReadAck(mq.base.db, mq.tbl)
-	if err != nil {
-		l.Error("[delta] vacuuming error", "err", err)
-		return
-	}
-	if removed > 0 {
-		l.Info("[delta] vacuuming result", "removed", removed, "in", mq.CurrentStream())
-	}
-
 }

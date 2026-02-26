@@ -33,9 +33,9 @@ func (mq *MQ) write(m Msg) (Msg, error) {
 	}
 
 	if m.MessageId%1000 == 1000-1 {
-		err = ackWritten(mq.base.db, m.MessageId, mq.tbl)
+		err = checkpointWrittenCursor(mq.base.db, m.MessageId, mq.tbl)
 		if err != nil {
-			return m, fmt.Errorf("could not ack written, %w", err)
+			return m, fmt.Errorf("could not checkpoint written cursor, %w", err)
 		}
 	}
 
@@ -43,6 +43,9 @@ func (mq *MQ) write(m Msg) (Msg, error) {
 
 }
 
+// Publish persists a message to the current stream and notifies matching subscribers.
+//
+// It validates and normalizes topic before writing.
 func (mq *MQ) Publish(topic string, payload []byte) (*Publication, error) {
 	pub := &Publication{
 		done: make(chan struct{}),
@@ -65,6 +68,9 @@ func (mq *MQ) Publish(topic string, payload []byte) (*Publication, error) {
 	return pub, err
 }
 
+// PublishAsync publishes a message in a background goroutine.
+//
+// Use Publication.Done to wait for completion and then inspect Publication.Err.
 func (mq *MQ) PublishAsync(topic string, payload []byte) *Publication {
 	payloadCopy := append([]byte{}, payload...)
 	pub := &Publication{

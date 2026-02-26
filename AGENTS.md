@@ -48,7 +48,6 @@ This section documents all exported symbols that constitute the public API.
 |----------|------|-----------|-------------|
 | `VacuumOnAge` | util.go:181 | `VacuumOnAge(maxAge time.Duration) VacuumFunc` | Removes messages older than specified duration |
 | `VacuumKeepN` | util.go:203 | `VacuumKeepN(n int) VacuumFunc` | Keeps only N most recent messages |
-| `VacuumOnReadAck` | util.go:220 | `VacuumOnReadAck(mq *MQ)` | Removes acknowledged messages (must call `Msg.Ack()`) |
 
 ### MQ Methods
 
@@ -86,7 +85,6 @@ This section documents all exported symbols that constitute the public API.
 | Method | File | Signature | Description |
 |--------|------|-----------|-------------|
 | `Reply` | mq.go:412 | `(m *Msg) Reply(payload []byte) (Msg, error)` | Replies to a message (publishes to `_inbox.{MessageId}`) |
-| `Ack` | mq.go:427 | `(m *Msg) Ack() error` | Acknowledges the message for `VacuumOnReadAck` |
 
 ### Publication Methods
 
@@ -121,8 +119,8 @@ This section documents all exported symbols that constitute the public API.
 
 **Total Public API Surface:**
 - 6 Types: `MQ`, `Msg`, `Publication`, `Subscription`, `Op`, `VacuumFunc`
-- 12 Functions: `New`, `URITemp`, `URIFromPath`, `RemoveStore`, `DBSyncOff`, `DBRemoveOnClose`, `WithLogger`, `WithVacuum`, `VacuumOnAge`, `VacuumKeepN`, `VacuumOnReadAck`
-- 17 Methods: 10 on MQ, 2 on Msg, 1 on Publication, 4 on Subscription
+- 11 Functions: `New`, `URITemp`, `URIFromPath`, `RemoveStore`, `DBSyncOff`, `DBRemoveOnClose`, `WithLogger`, `WithVacuum`, `VacuumOnAge`, `VacuumKeepN`
+- 16 Methods: 10 on MQ, 1 on Msg, 1 on Publication, 4 on Subscription
 - 3 Constants: `DEFAULT_STREAM`, `OptimizeLatency`, `OptimizeThroughput`
 
 ## Build / Test / Lint Commands
@@ -280,4 +278,4 @@ return errors.Join(
 - Custom driver registered in `init()` as `"sqlite3_delta-v"` with a `match_glob` SQL function.
 - WAL journal mode, normal synchronous by default.
 - Schema uses parameterized table names via `fmt.Sprintf` (not SQL parameters).
-- Vacuum strategies: `VacuumOnAge`, `VacuumKeepN`, `VacuumOnReadAck`.
+- Vacuum strategies: `VacuumOnAge`, `VacuumKeepN`.

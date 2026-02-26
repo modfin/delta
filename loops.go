@@ -72,11 +72,9 @@ func (mq *MQ) readloop() {
 
 				if dirty {
 					dirty = false
-					// TODO ack read is great and all, but for a vacuum, we might end up in a place where we delete a message
-					// prior to it being read by the consumer.
-					err := ackRead(mq.base.db, atomic.LoadUint64(&mq.stream.read), mq.tbl)
+					err := checkpointReadCursor(mq.base.db, atomic.LoadUint64(&mq.stream.read), mq.tbl)
 					if err != nil {
-						mq.base.log.Error("[delta] could not ack read", "err", err, "stream_", mq.CurrentStream())
+						mq.base.log.Error("[delta] could not checkpoint read cursor", "err", err, "stream_", mq.CurrentStream())
 					}
 				}
 

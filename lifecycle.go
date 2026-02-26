@@ -50,6 +50,10 @@ func init() {
 		})
 }
 
+// New creates an MQ backed by the provided SQLite URI.
+//
+// It initializes schema, applies options, restores stream cursors, and starts
+// background read and vacuum loops.
 func New(uri string, op ...Op) (*MQ, error) {
 
 	db, err := sql.Open("sqlite3_delta-v", uri)
@@ -134,6 +138,9 @@ func New(uri string, op ...Op) (*MQ, error) {
 	return c, nil
 }
 
+// Stream returns a named stream in the same backing database.
+//
+// If the stream already exists in memory, the existing instance is returned.
 func (c *MQ) Stream(stream string, ops ...Op) (*MQ, error) {
 	c.base.streamMu.Lock()
 	defer c.base.streamMu.Unlock() // write lock: mutates base.streams
@@ -205,7 +212,9 @@ func schema(c *MQ) error {
 	)
 }
 
-// Close closes the cache and all its namespaces
+// Close closes the MQ, all streams, and the shared DB connection.
+//
+// Close is safe to call multiple times.
 func (c *MQ) Close() error {
 
 	defer func() {
@@ -232,9 +241,9 @@ func (c *MQ) Close() error {
 
 	var errs []error
 	for _, cc := range streams {
-		err := ackWritten(cc.base.db, atomic.LoadUint64(&cc.stream.written), cc.tbl)
+		err := checkpointWrittenCursor(cc.base.db, atomic.LoadUint64(&cc.stream.written), cc.tbl)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("could not ack written, %w", err))
+			errs = append(errs, fmt.Errorf("could not checkpoint written cursor, %w", err))
 			continue
 		}
 		w, r, err := metrics(cc.base.db, cc.tbl)
@@ -248,6 +257,9 @@ func (c *MQ) Close() error {
 	return errors.Join(errs...)
 }
 
+// RemoveStore removes database files for a file: URI.
+//
+// It removes the main DB file plus optional -shm and -wal files.
 func RemoveStore(uri string, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.New(discardLogger{})
@@ -300,6 +312,7 @@ func (c *MQ) tbl() string {
 	return fmt.Sprintf("_mq_delta_stream_%s", c.CurrentStream())
 }
 
+// CurrentStream returns the active stream name for this MQ handle.
 func (c *MQ) CurrentStream() string {
 	return c.stream.name
 }
