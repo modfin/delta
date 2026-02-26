@@ -61,6 +61,55 @@ func (g glob) Id() string {
 //	fmt.Println("match", "a.x.c", trie.Match("a.x.c"))     // [{2.5 a.*.c} {6 a.**}]
 //}
 
+func TestGlobMatcher_LengthMismatch(t *testing.T) {
+	// globMatcher is the SQL function registered as match_glob, used by SubscribeFrom
+	// to filter historical messages. It should only match when the topic and glob have
+	// the same structure (same number of segments), unless wildcards allow it.
+
+	tests := []struct {
+		name     string
+		topic    string
+		glob     string
+		expected bool
+	}{
+		// Exact matches -- should match
+		{name: "exact match single", topic: "a", glob: "a", expected: true},
+		{name: "exact match multi", topic: "a.b.c", glob: "a.b.c", expected: true},
+
+		// Wildcard matches -- should match
+		{name: "single wildcard", topic: "a.b.c", glob: "a.*.c", expected: true},
+		{name: "double wildcard", topic: "a.b.c.d.e", glob: "a.**", expected: true},
+
+		// Mismatch values -- should not match
+		{name: "different value", topic: "a.b.c", glob: "a.x.c", expected: false},
+
+		// BUG: glob shorter than topic -- should NOT match, but globMatcher returns true.
+		// A subscriber to "a.b" should not receive messages published to "a.b.c".
+		{name: "glob shorter than topic", topic: "a.b.c", glob: "a.b", expected: false},
+		{name: "glob shorter than topic 2", topic: "a.b.c.d", glob: "a.b", expected: false},
+
+		// BUG: topic shorter than glob -- should NOT match, but globMatcher returns true.
+		// A message published to "a" should not match a subscriber on "a.b".
+		{name: "topic shorter than glob", topic: "a", glob: "a.b", expected: false},
+		{name: "topic shorter than glob 2", topic: "a.b", glob: "a.b.c.d", expected: false},
+
+		// Wildcard with length mismatch -- ** should still match longer topics
+		{name: "double wildcard matches deeper", topic: "a.b.c.d.e", glob: "a.b.**", expected: true},
+
+		// Single wildcard should NOT match across depth levels
+		{name: "single wildcard same depth", topic: "a.x", glob: "a.*", expected: true},
+		{name: "single wildcard diff depth", topic: "a.x.c", glob: "a.*", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := globMatcher(tt.topic, tt.glob)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, got, "globMatcher(%q, %q) = %v, want %v", tt.topic, tt.glob, got, tt.expected)
+		})
+	}
+}
+
 func TestGlobTopic_Insert(t *testing.T) {
 	trie := newGlobber[glob]()
 	trie.Insert(glob{id: "1", pattern: "a.b.c.d"})
@@ -149,6 +198,53 @@ func TestGlobTopic_InsertAndMatch(t *testing.T) {
 
 		assert.ElementsMatch(t, expectedIDs, matchedIDs, "Incorrect matches for topic %s", topic)
 	}
+}
+
+// TestGlobTopic_Remove_NonExistentPath exercises the early-return in Remove()
+// when the subscription's path does not exist in the trie. This covers the
+// `if _, ok := node.children[part]; !ok { return }` branch (previously 0%).
+func TestGlobTopic_Remove_NonExistentPath(t *testing.T) {
+	trie := newGlobber[glob]()
+	trie.Insert(glob{"1", "a.b.c"})
+
+	// Remove a topic whose path diverges at the second segment — "x" is
+	// never a child of the root node.
+	trie.Remove(glob{"99", "a.x.c"}) // must not panic or mutate state
+
+	// The original entry must still match.
+	matches := trie.Match("a.b.c")
+	assert.Len(t, matches, 1)
+	assert.Equal(t, "1", matches[0].Id())
+
+	// Remove a completely absent top-level path.
+	trie.Remove(glob{"99", "z.z.z"}) // must not panic
+	matches = trie.Match("a.b.c")
+	assert.Len(t, matches, 1)
+
+	// Remove an entry whose ID does not appear in the matching node's subs
+	// (path exists but ID is wrong) — iterates node.subs without finding it.
+	trie.Remove(glob{"nonexistent-id", "a.b.c"})
+	matches = trie.Match("a.b.c")
+	assert.Len(t, matches, 1, "wrong-ID remove must leave existing sub intact")
+}
+
+// TestGlobTopic_Print exercises Print() and printRecursive() which were at 0%
+// coverage. We only verify the call doesn't panic; output goes to stdout.
+func TestGlobTopic_Print(t *testing.T) {
+	trie := newGlobber[glob]()
+	// Empty trie — should not panic.
+	assert.NotPanics(t, trie.Print)
+
+	// Populated trie with multiple patterns.
+	for _, g := range []glob{
+		{"1", "a.b.c"},
+		{"2", "a.*.c"},
+		{"3", "a.**"},
+		{"4", "x.y"},
+	} {
+		trie.Insert(g)
+	}
+	assert.NotPanics(t, trie.Print)
 }
 
 func TestGlobTopic_Remove2(t *testing.T) {

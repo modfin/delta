@@ -8,7 +8,7 @@ import (
 type discardLogger struct{}
 
 func (d discardLogger) Enabled(ctx context.Context, level slog.Level) bool {
-	return true
+	return false
 }
 
 func (d discardLogger) Handle(ctx context.Context, record slog.Record) error {

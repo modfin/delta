@@ -19,7 +19,7 @@ type query interface {
 
 const base_schema = `CREATE TABLE IF NOT EXISTS %s (
     			message_id BIGINT PRIMARY KEY,
-    			topic TEXT, 
+    			topic TEXT,
     			payload BLOB,
     			created_at BIGINT
 		 );`
@@ -41,40 +41,41 @@ func exec(db query, qs ...string) error {
 	return nil
 }
 
-func ackRead(db query, read uint64, tbl func() string) error {
-	q := fmt.Sprintf(`
-		INSERT INTO _mq_delta_metadata (key, value, created_at) 
-		VALUES ($1, CAST($2 AS TEXT), $3) 
+func checkpointReadCursor(db query, read uint64, tbl func() string) error {
+	q := `
+		INSERT INTO _mq_delta_metadata (key, value, created_at)
+		VALUES ($1, CAST($2 AS TEXT), $3)
 		ON CONFLICT (key)
-		    DO UPDATE 
-		    SET 
-		        value = excluded.value, 
-		        created_at = excluded.created_at`)
-	_, err := db.Exec(q, tbl()+"_read", read, time.Now().UnixNano())
+		    DO UPDATE
+		    SET
+		        value = excluded.value,
+		        created_at = excluded.created_at`
+	_, err := db.Exec(q, tbl()+"_read_cursor", read, time.Now().UnixNano())
 	return err
 }
-func ackWritten(db query, written uint64, tbl func() string) error {
-	q := fmt.Sprintf(`
-		INSERT INTO _mq_delta_metadata (key, value, created_at) 
-		VALUES ($1, CAST($2 AS TEXT), $3) 
+func checkpointWrittenCursor(db query, written uint64, tbl func() string) error {
+	q := `
+		INSERT INTO _mq_delta_metadata (key, value, created_at)
+		VALUES ($1, CAST($2 AS TEXT), $3)
 		ON CONFLICT (key)
-		    DO UPDATE 
-		    SET 
-		        value = excluded.value, 
-		        created_at = excluded.created_at`)
-	_, err := db.Exec(q, tbl()+"_written", written, time.Now().UnixNano())
+		    DO UPDATE
+		    SET
+		        value = excluded.value,
+		        created_at = excluded.created_at`
+	_, err := db.Exec(q, tbl()+"_written_cursor", written, time.Now().UnixNano())
 	return err
 }
 
 func metrics(db query, tbl func() string) (written uint64, read uint64, err error) {
 	q := fmt.Sprintf(`
 		SELECT
-   	       (SELECT coalesce(MAX(message_id), 0) FROM %s ) as "written",
+	   	       (SELECT coalesce(MAX(message_id), 0) FROM %s ) as "written",
 		   coalesce(
+		   		(SELECT CAST("value" as BIGINT )  FROM _mq_delta_metadata WHERE "key" = ($1 || '_read_cursor')),
 		   		(SELECT CAST("value" as BIGINT )  FROM _mq_delta_metadata WHERE "key" = ($1 || '_read'))
 		   		, 1
-		   ) "read"	
-   	
+		   ) "read"
+
 	`, tbl())
 	r := db.QueryRow(q, tbl())
 
@@ -95,35 +96,17 @@ func persist(db query, m Msg, tbl func() string) error {
 	return err
 }
 
-func vacuumReadAck(db query, tbl func() string) (int64, error) {
-	table := tbl()
-	q := fmt.Sprintf(`
-	DELETE FROM %s 
-    WHERE message_id < (
-        SELECT CAST("value" as BIGINT )  
-        FROM _mq_delta_metadata 
-        WHERE "key" = ($1 || '_read')
-    ) 
-    `, table)
-
-	r, err := db.Exec(q, table)
-
-	if err != nil {
-		return 0, err
-	}
-
-	return r.RowsAffected()
-}
-
 func vacuumBefore(db query, before time.Time, tbl func() string) (int64, error) {
 	table := tbl()
 	q := fmt.Sprintf(`
-	DELETE FROM %s 
+	DELETE FROM %s
     WHERE created_at < $1
 	AND message_id < (
-		SELECT CAST("value" as BIGINT )
-		FROM _mq_delta_metadata 
-		WHERE "key" = ($2 || '_read')
+		SELECT coalesce(
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read_cursor')),
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read')),
+			1
+		)
     )
     `, table)
 
@@ -138,16 +121,18 @@ func vacuumBefore(db query, before time.Time, tbl func() string) (int64, error) 
 func vacuumKeep(db query, keep int, tbl func() string) (int64, error) {
 	table := tbl()
 	q := fmt.Sprintf(`
-	DELETE FROM %s 
+	DELETE FROM %s
     WHERE message_id NOT IN (
-	    SELECT message_id FROM %s 
+	    SELECT message_id FROM %s
 	    ORDER BY message_id DESC
 	    LIMIT $1
     )
     AND message_id < (
-		SELECT CAST("value" as BIGINT )
-		FROM _mq_delta_metadata 
-		WHERE "key" = ($2 || '_read')
+		SELECT coalesce(
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read_cursor')),
+			(SELECT CAST("value" as BIGINT ) FROM _mq_delta_metadata WHERE "key" = ($2 || '_read')),
+			1
+		)
     )
     `, table, table)
 
@@ -183,10 +168,10 @@ func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() s
 	var err error
 	if !glob {
 		rows, err = db.Query(fmt.Sprintf(`
-				SELECT message_id, topic, payload, created_at 
-				FROM %s 
-				WHERE topic = $1 
-				  AND created_at >= $2 
+				SELECT message_id, topic, payload, created_at
+				FROM %s
+				WHERE topic = $1
+				  AND created_at >= $2
 				  AND message_id <= $3
 				ORDER BY created_at`, tbl()), topic, from.UnixNano(), to)
 	}
@@ -195,21 +180,21 @@ func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() s
 		start, _, _ := strings.Cut(topic, "*")
 		start = start + "%"
 		rows, err = db.Query(fmt.Sprintf(`
-				SELECT message_id, topic, payload, created_at 
-				FROM %s 
-				WHERE topic like $1 
-				  AND match_glob(topic, $2) 
-				  AND created_at >= $3 
+				SELECT message_id, topic, payload, created_at
+				FROM %s
+				WHERE topic like $1
+				  AND match_glob(topic, $2)
+				  AND created_at >= $3
 				  AND message_id <= $4
 				ORDER BY created_at`, tbl()), start, topic, from.UnixNano(), to)
 	}
 
 	if err != nil {
 		if log != nil {
-			log.Error("[cove] iterKV, could not query in iter", "err", err)
+			log.Error("[delta] iterKV, could not query in iter", "err", err)
 			return func(yield func(msg Msg) bool) {}
 		}
-		_, _ = fmt.Fprintf(os.Stderr, "[cove] iterKV, could not query in iter, %v", err)
+		_, _ = fmt.Fprintf(os.Stderr, "[delta] iterKV, could not query in iter, %v", err)
 		return func(yield func(msg Msg) bool) {}
 
 	}
@@ -224,10 +209,10 @@ func iterMessage(db query, topic string, from time.Time, to uint64, tbl func() s
 
 			if err != nil {
 				if log != nil {
-					log.Error("[cove] iterKV, could not scan in iter,", "err", err)
+					log.Error("[delta] iterKV, could not scan in iter", "err", err)
 					return
 				}
-				_, _ = fmt.Fprintf(os.Stderr, "cove: iterKV, could not scan in iter, %v", err)
+				_, _ = fmt.Fprintf(os.Stderr, "[delta] iterKV, could not scan in iter, %v", err)
 				return
 			}
 			if !yield(m) {
